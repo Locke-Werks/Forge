@@ -1,0 +1,39 @@
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+.vs/
+.vscode/
+*.user
+
+# vcpkg manifest mode installs here, per binary dir and at the root.
+vcpkg_installed/
+_deps/
+compile_commands.json
+
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+
+# Signing inputs. metadata.json is generated from metadata.json.in so the
+# certificate profile lives in exactly one place and cannot drift the way it did
+# across DeadLetter, MCPmcp, MTGSim and specterpoint.
+signing/metadata.json
+signing/*.env
+*.pfx
+*.snk
+
+# Forged installers and staged payloads. Outputs, never inputs.
+dist/
+stage/
+*-Setup.exe
+
+# Local session notes. See docs/ for anything that should outlive a branch.
+CLAUDE.md
+.claude/
+
+Thumbs.db
+desktop.ini

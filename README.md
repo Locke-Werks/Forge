@@ -1,0 +1,82 @@
+# lwi
+
+A universal, extensible Windows installer. One signed stub, compiled once, plus
+a packaging tool that stamps a product's configuration and payload into a copy
+of it. Building an installer needs no C++ toolchain.
+
+## What it is
+
+Three pieces:
+
+- `lwi_core` is a static library with no third-party dependencies: PE layout
+  parsing, the container format, SHA-256 over CNG, and LZMS compression through
+  the in-box Windows Compression API.
+- `lwstub.exe` is the installer. Direct2D and DirectWrite, owner-drawn, x64,
+  zero third-party dependencies.
+- `lwforge.exe` reads a TOML config and a payload directory and writes a signed,
+  single-file installer.
+
+The stub reads a compact binary blob the forge produced. It never parses text,
+so the elevated signed binary carries no text parser and links nothing from
+vcpkg.
+
+## How packaging works
+
+Order matters, because signing is what makes the bytes immutable:
+
+1. Copy the stub.
+2. Replace the icon, version resource and manifest with `UpdateResource`.
+3. Append the container.
+4. Pad the file to an 8-byte multiple.
+5. Sign.
+
+Data appended past the last section but before the certificate table is covered
+by the Authenticode digest. That was verified by recomputing the digest of a
+real signed binary two ways, not assumed. Signing first and appending second
+would leave the payload outside the hash, which is the CVE-2013-3900 shape and
+is what this design must not do.
+
+At runtime the stub reads the security data directory to find where the
+certificate table begins, and looks for its footer immediately before it. That
+directory entry's `VirtualAddress` is a file offset rather than an RVA, which is
+the usual bug in self-extracting code.
+
+See `docs/container-format.md` for the byte layout.
+
+## Build
+
+Requires Visual Studio 2022, CMake 3.28 or newer, and `VCPKG_ROOT` set.
+
+```
+cmake --preset vs
+cmake --build build/vs --config Debug
+ctest --test-dir build/vs -C Debug --output-on-failure
+```
+
+`--preset vs` uses the Visual Studio generator and works from any shell. The
+`dev` and `ci` presets use Ninja and need an x64 Native Tools prompt, or
+`scripts/build.ps1`, which sets one up.
+
+`/Qspectre` is applied only when the Spectre-mitigated libraries are installed.
+They are not part of a default Visual Studio Community installation; configure
+reports whether they were found.
+
+## Signing
+
+Azure Artifact Signing, formerly Trusted Signing. Certificates are valid for
+three days, so timestamping is mandatory rather than optional.
+
+```
+scripts/sign.ps1 -FilePath dist/Setup.exe
+```
+
+Needs `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`, and the
+client tools from `winget install -e --id Microsoft.Azure.ArtifactSigningClientTools`.
+The script probes both the current and the pre-rename install locations, and
+discovers signtool by scanning the Windows Kits directory rather than pinning an
+SDK version.
+
+## License
+
+MIT. Deliberately permissive: the stub ships inside installers for products
+under several different licenses, and a copyleft stub would constrain that.

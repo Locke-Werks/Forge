@@ -1,0 +1,67 @@
+#!/bin/sh
+# Reject a commit that contains a credential.
+#
+# A Google client_secret reached three public releases inside one 18,353-line
+# commit. Nothing mechanical stopped it, and no human review of a diff that size
+# was ever going to. This scans staged content, so it fires before the object
+# exists rather than after it is published.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass (do not):        git commit --no-verify
+
+set -eu
+
+# Only added lines, and only in files being committed.
+added=$(git diff --cached --no-color --unified=0 --diff-filter=ACM |
+        grep -E '^\+' | grep -Ev '^\+\+\+' || true)
+
+if [ -z "$added" ]; then
+    exit 0
+fi
+
+fail=0
+report() {
+    if [ "$fail" -eq 0 ]; then
+        printf '\n\033[31mCommit rejected: credential in staged changes\033[0m\n\n' >&2
+    fi
+    fail=1
+    printf '  %s\n' "$1" >&2
+}
+
+# A Google client secret. The literal prefix is the whole tell.
+if printf '%s' "$added" | grep -Eq 'GOCSPX-[A-Za-z0-9_-]{10,}'; then
+    report 'Google OAuth client_secret (GOCSPX-...)'
+fi
+
+# A real Google installed-app client id. The scanner in scripts/ uses the same
+# shape; keep the two in step.
+if printf '%s' "$added" | grep -Eq '[0-9]{6,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com'; then
+    report 'Google OAuth client_id (belongs in config, not source)'
+fi
+
+# Assignment of a non-empty secret, whatever the provider.
+if printf '%s' "$added" | grep -Eiq '(client_secret|api_key|apikey|password|passwd)[[:space:]]*[=:][[:space:]]*"[^"]{8,}"'; then
+    report 'hardcoded secret assignment'
+fi
+
+if printf '%s' "$added" | grep -Eq 'BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY'; then
+    report 'private key'
+fi
+
+if printf '%s' "$added" | grep -Eq 'AKIA[0-9A-Z]{16}'; then
+    report 'AWS access key id'
+fi
+
+if [ "$fail" -ne 0 ]; then
+    cat >&2 <<'EOF'
+
+Credentials resolve at runtime, never from source:
+  environment  DEADLETTER_GOOGLE_CLIENT_ID / _SECRET, DEADLETTER_MS_CLIENT_ID
+  build-time   cmake -DDEADLETTER_GOOGLE_CLIENT_SECRET=...
+  release      GitHub Actions secret, injected at configure time
+
+EOF
+    exit 1
+fi
+
+exit 0

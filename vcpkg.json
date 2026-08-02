@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "lwi",
+  "version-string": "0.1.0",
+  "description": "Locke Werks universal Windows installer",
+  "$comment": [
+    "tomlplusplus is used by lwforge only. The installer stub never parses text:",
+    "it reads a compact binary blob the forge produced, so the elevated signed",
+    "binary carries no text parser and links nothing from vcpkg.",
+    "doctest is the test framework, matching Reliquary."
+  ],
+  "dependencies": [
+    "tomlplusplus",
+    "doctest"
+  ]
+}
