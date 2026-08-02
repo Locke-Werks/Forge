@@ -8,6 +8,7 @@ add_executable(lwstub WIN32
     main.cpp
     ui.cpp
     ops.cpp
+    checks.cpp
     theme.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/stub.rc"
 )
@@ -29,6 +30,7 @@ target_link_libraries(lwstub PRIVATE
     shlwapi
     comctl32
     advapi32
+    rstrtmgr    # Restart Manager, for finding what holds a file open
 )
 
 lwi_apply_warnings(lwstub)

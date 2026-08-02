@@ -3,9 +3,11 @@
 #include <shellapi.h> // CommandLineToArgvW
 #include <shlobj.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
+#include "checks.h"
 #include "lwi/config.h"
 #include "lwi/container.h"
 #include "lwi/win_file.h"
@@ -25,6 +27,15 @@ constexpr int kExitSuccess = 0;
 constexpr int kExitUserCancel = 1602;
 constexpr int kExitFailure = 1603;
 constexpr int kExitAlreadyRunning = 1618;
+
+// ERROR_PRODUCT_VERSION. It means "another version is installed" with no
+// direction implied, so the message has to say which way, but it is the code
+// deployment tools recognise for this situation.
+constexpr int kExitOtherVersion = 1638;
+
+// ERROR_INSTALL_PREREQUISITE_FAILED. Distinct from a general failure so an
+// operator can tell "this machine does not qualify" from "this install broke".
+constexpr int kExitPrerequisite = 1603;
 
 struct Options
 {
@@ -91,6 +102,25 @@ Options parse_command_line()
 
     LocalFree(argv);
     return options;
+}
+
+/// Maps preflight outcomes onto an exit code.
+///
+/// Shared by --check-only and the silent path so the two cannot disagree about
+/// what a given machine state means. They did: check-only reported a refused
+/// downgrade as a generic failure while the installer reported 1638.
+int exit_code_for(const std::vector<CheckOutcome>& outcomes)
+{
+    if (!has_blocking_failure(outcomes))
+    {
+        return kExitSuccess;
+    }
+    const bool downgrade = std::any_of(outcomes.begin(), outcomes.end(),
+                                       [](const CheckOutcome& outcome) {
+                                           return outcome.state == CheckState::Fail &&
+                                                  outcome.type == "downgrade";
+                                       });
+    return downgrade ? kExitOtherVersion : kExitPrerequisite;
 }
 
 std::wstring known_folder(REFKNOWNFOLDERID id)
@@ -419,14 +449,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
         report += "config      " + std::to_string(config.entries().size()) + " keys\n";
         if (const std::wstring prior = installed_version(plan); !prior.empty())
         {
-            report += "installed   " + to_utf8(prior) + " (this run would upgrade)\n";
+            report += "installed   " + to_utf8(prior) + "\n";
         }
         if (reader.is_dev_build())
         {
             report += "build       UNSIGNED DEV BUILD\n";
         }
+
+        const std::vector<CheckOutcome> outcomes = run_preflight(config, plan);
+        report += "\npreflight\n";
+        report += outcomes.empty() ? "  (none declared)\n" : format_outcomes(outcomes);
         write_console(report);
-        return kExitSuccess;
+
+        // --check-only is the flag a deployment tool runs first to decide
+        // whether to bother. It must report qualification through its exit
+        // code, not only in text nobody parses.
+        return exit_code_for(outcomes);
     }
 
     // One installer at a time. A second copy racing the first over the same
@@ -446,8 +484,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 
     int result = kExitSuccess;
 
+    // Preflight runs before anything is written, in every mode. A check that
+    // only runs in the interactive path is a check that never runs where it
+    // matters, because unattended deployment is exactly where nobody is
+    // watching.
+    const std::vector<CheckOutcome> outcomes = run_preflight(config, plan);
+
     if (options.silent)
     {
+        if (has_blocking_failure(outcomes))
+        {
+            write_console("lwi: preflight failed\n" + format_outcomes(outcomes));
+            CoUninitialize();
+            if (mutex != nullptr)
+            {
+                ReleaseMutex(mutex);
+                CloseHandle(mutex);
+            }
+            return exit_code_for(outcomes);
+        }
+
         std::vector<std::string> warnings;
         const Status s = run_install(reader, config, plan, nullptr, &warnings);
         for (const std::string& warning : warnings)
@@ -472,6 +528,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             return kExitFailure;
         }
         wizard.set_install_dir(install_dir);
+
+        // A machine that does not qualify is told so before it is shown a
+        // license to accept. Presenting the license first and failing after
+        // wastes the only decision the user was asked to make.
+        if (has_blocking_failure(outcomes))
+        {
+            std::wstring message;
+            for (const CheckOutcome& outcome : outcomes)
+            {
+                if (outcome.state != CheckState::Fail)
+                {
+                    continue;
+                }
+                if (!message.empty())
+                {
+                    message += L"\n\n";
+                }
+                message += outcome.message;
+                if (!outcome.detail.empty())
+                {
+                    message += L"\n(" + outcome.detail + L")";
+                }
+            }
+            wizard.finish_error(message);
+            wizard.run();
+            CoUninitialize();
+            if (mutex != nullptr)
+            {
+                ReleaseMutex(mutex);
+                CloseHandle(mutex);
+            }
+            return exit_code_for(outcomes);
+        }
 
         wizard.on_install([&] {
             // COM apartments are per thread, and this thread creates shortcuts.

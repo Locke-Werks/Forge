@@ -6,6 +6,7 @@ add_library(lwi_core STATIC
     pe_layout.cpp
     container.cpp
     config.cpp
+    version.cpp
 )
 
 target_include_directories(lwi_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
