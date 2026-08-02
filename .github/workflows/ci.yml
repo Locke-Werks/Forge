@@ -1,0 +1,222 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+
+jobs:
+  # Cheap checks first. A secret or a stray timestamp macro should stop the run
+  # before anyone waits on a compile.
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No committed signing metadata
+        shell: bash
+        run: |
+          # metadata.json is generated from signing.env so the certificate
+          # profile lives in exactly one place. It drifted into three different
+          # values across four other repositories by being committed.
+          if [ -f signing/metadata.json ]; then
+            echo "signing/metadata.json is committed; it must be generated"
+            exit 1
+          fi
+
+      - name: No build timestamps in source
+        shell: bash
+        run: |
+          # __DATE__ and friends make a build unreproducible for no benefit.
+          # /Brepro handles the linker side; this handles the source side.
+          if grep -rn --include='*.cpp' --include='*.h' -E '__DATE__|__TIME__|__TIMESTAMP__' src/; then
+            echo "build timestamp macros are not allowed"
+            exit 1
+          fi
+
+      - name: No credentials
+        shell: bash
+        run: |
+          if grep -rnE 'AZURE_CLIENT_SECRET[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']' \
+              --include='*.ps1' --include='*.yml' --include='*.cpp' . ; then
+            echo "a credential appears to be hardcoded"
+            exit 1
+          fi
+
+  build:
+    needs: guards
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lukka/get-cmake@latest
+
+      - name: Export vcpkg cache credentials
+        uses: actions/github-script@v7
+        with:
+          script: core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '')
+
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: d3a1e8c161275780ebf2eebd8c6b70d9fabc0a19
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake --preset ci
+
+      - name: Build
+        run: cmake --build build/ci
+
+      - name: Test
+        run: ctest --preset ci
+
+      # The stub and the forge are useless to a consumer separately, and the
+      # end-to-end path is the only thing that proves the container survives
+      # resource stamping. Building a real installer here is the actual test.
+      - name: Forge a demo installer
+        run: |
+          ./scripts/New-DemoPayload.ps1
+          ./build/ci/src/forge/lwforge.exe build `
+            --config examples/deadletter/installer.toml `
+            --payload build/stage-demo `
+            --stub build/ci/src/stub/lwstub.exe `
+            --out dist/DeadLetter-Setup.exe `
+            --dev
+        shell: pwsh
+
+      - name: The forged installer can read its own container
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "$PWD/dist/DeadLetter-Setup.exe" `
+                             -ArgumentList '--check-only' -Wait -PassThru `
+                             -WindowStyle Hidden -RedirectStandardOutput check.log
+          Get-Content check.log
+          if ($p.ExitCode -ne 0) { throw "check-only exited $($p.ExitCode)" }
+
+      - name: Install and uninstall for real
+        shell: pwsh
+        run: |
+          $target = "$env:LOCALAPPDATA\Programs\CiTest"
+          $p = Start-Process -FilePath "$PWD/dist/DeadLetter-Setup.exe" `
+                             -ArgumentList '/S', "/D=$target" -Wait -PassThru `
+                             -WindowStyle Hidden -RedirectStandardOutput install.log
+          Get-Content install.log
+          if ($p.ExitCode -ne 0) { throw "install exited $($p.ExitCode)" }
+          if (-not (Test-Path "$target\bin\deadletter.exe")) { throw "payload missing" }
+
+          $arp = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\DeadLetter'
+          if (-not (Test-Path $arp)) { throw "no Add/Remove Programs entry" }
+
+          $p = Start-Process -FilePath "$target\.lw\uninstall.exe" `
+                             -ArgumentList '/uninstall', '/S' -Wait -PassThru -WindowStyle Hidden
+          if ($p.ExitCode -ne 0) { throw "uninstall exited $($p.ExitCode)" }
+          Start-Sleep -Seconds 5
+          if (Test-Path $target) { throw "install directory survived uninstall" }
+          if (Test-Path $arp) { throw "ARP entry survived uninstall" }
+
+      - name: Tampering must be detected
+        shell: pwsh
+        run: |
+          # The architecture rests on appended data being inside the
+          # Authenticode digest. Unsigned here, so this checks the container's
+          # own hash gate, which is the half that works without a certificate.
+          Copy-Item dist/DeadLetter-Setup.exe dist/Tampered.exe
+          $bytes = [IO.File]::ReadAllBytes("$PWD/dist/Tampered.exe")
+          $offset = [int]($bytes.Length * 0.9)
+          $bytes[$offset] = $bytes[$offset] -bxor 0xFF
+          [IO.File]::WriteAllBytes("$PWD/dist/Tampered.exe", $bytes)
+
+          $p = Start-Process -FilePath "$PWD/dist/Tampered.exe" -ArgumentList '--check-only' `
+                             -Wait -PassThru -WindowStyle Hidden
+          if ($p.ExitCode -eq 0) { throw "a tampered installer was accepted" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lwi-unsigned
+          path: |
+            build/ci/src/forge/lwforge.exe
+            build/ci/src/stub/lwstub.exe
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      id-token: write   # OIDC. No client secret is stored anywhere.
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: lwi-unsigned
+          path: staged
+
+      # Fail on missing configuration before anything expensive runs, and
+      # before a partially-configured signing step produces an unsigned
+      # artifact that looks like a successful build.
+      - name: Preflight the signing configuration
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID') {
+            if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue).Value) { $missing += $name }
+          }
+          if ($missing) { throw "missing repository variables: $($missing -join ', ')" }
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: https://eus.codesigning.azure.net
+          trusted-signing-account-name: specterpoint
+          certificate-profile-name: specterpoint
+          files-folder: staged
+          files-folder-filter: exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          # Certificates are valid for three days, so the timestamp is what
+          # keeps the signature valid past the weekend. It is not optional.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify every artifact is actually signed
+        shell: pwsh
+        run: |
+          # The signing step exiting zero is not the same as the file being
+          # signed. This is the check that catches a silently skipped folder.
+          $files = Get-ChildItem staged -Recurse -Include *.exe
+          if (-not $files) { throw "nothing to verify" }
+          foreach ($file in $files) {
+            $sig = Get-AuthenticodeSignature -FilePath $file.FullName
+            "$($file.Name): $($sig.Status)"
+            if ($sig.Status -ne 'Valid') { throw "$($file.Name) is $($sig.Status)" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lwi-signed
+          path: staged
+          if-no-files-found: error
