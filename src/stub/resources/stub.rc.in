@@ -1,0 +1,36 @@
+// Generated from stub.rc.in. Do not edit the generated copy.
+// Version lives in cmake/LwiVersion.cmake.
+//
+// lwforge replaces this version resource when it stamps a product, so what is
+// here identifies the stub itself. It exists so an unstamped lwstub.exe is not
+// a version-less binary that security tooling flags on sight.
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    @LWI_VERSION_RC@
+PRODUCTVERSION @LWI_VERSION_RC@
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "@LWI_COMPANY@"
+            VALUE "FileDescription",  "Locke Werks Installer Stub"
+            VALUE "FileVersion",      "@LWI_VERSION_RC_STR@"
+            VALUE "InternalName",     "lwstub"
+            VALUE "LegalCopyright",   "@LWI_COPYRIGHT@"
+            VALUE "OriginalFilename", "lwstub.exe"
+            VALUE "ProductName",      "lwi"
+            VALUE "ProductVersion",   "@LWI_VERSION_RC_STR@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

@@ -25,23 +25,34 @@ if(LWI_HARDENING AND NOT LWI_SPECTRE_LIBS_FOUND)
         "     \"MSVC v143 - VS 2022 C++ x64/x86 Spectre-mitigated libs (Latest)\"")
 endif()
 
+# Pass NO_EHCONT for a target that links a third-party static library.
+#
+# /guard:ehcont is all-or-nothing at link time: LNK1386 rejects the whole image
+# if any object lacks the metadata, and a prebuilt vcpkg library will not have
+# it. That is fine to give up on build-time tooling, which never runs elevated
+# on a customer machine. The stub and the uninstaller, which do, keep it.
 function(lwi_apply_hardening target)
     if(NOT MSVC OR NOT LWI_HARDENING)
         return()
     endif()
 
+    set(_ehcont TRUE)
+    if("NO_EHCONT" IN_LIST ARGN)
+        set(_ehcont FALSE)
+    endif()
+
     target_compile_options(${target} PRIVATE
         /GS                       # stack buffer overrun detection
         /guard:cf                 # Control Flow Guard
-        /guard:ehcont             # EH continuation metadata, pairs with /CETCOMPAT
         /sdl                      # additional security checks, promotes some warnings
         /Gy /Gw                   # function and data COMDATs, lets /OPT:REF do its job
+        $<$<BOOL:${_ehcont}>:/guard:ehcont>
         $<$<BOOL:${LWI_SPECTRE_LIBS_FOUND}>:/Qspectre>
     )
 
     target_link_options(${target} PRIVATE
         /GUARD:CF
-        /GUARD:EHCONT
+        $<$<BOOL:${_ehcont}>:/GUARD:EHCONT>
         /DYNAMICBASE              # ASLR
         /HIGHENTROPYVA            # 64-bit ASLR entropy
         /NXCOMPAT                 # DEP

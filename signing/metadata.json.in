@@ -1,0 +1,16 @@
+{
+  "Endpoint": "@LWI_SIGN_ENDPOINT@",
+  "CodeSigningAccountName": "@LWI_SIGN_ACCOUNT@",
+  "CertificateProfileName": "@LWI_SIGN_PROFILE@",
+  "ExcludeCredentials": [
+    "ManagedIdentityCredential",
+    "WorkloadIdentityCredential",
+    "SharedTokenCacheCredential",
+    "VisualStudioCredential",
+    "VisualStudioCodeCredential",
+    "AzureCliCredential",
+    "AzurePowerShellCredential",
+    "AzureDeveloperCliCredential",
+    "InteractiveBrowserCredential"
+  ]
+}

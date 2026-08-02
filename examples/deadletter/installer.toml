@@ -1,0 +1,96 @@
+# Worked example: DeadLetter, a Qt6 QML desktop email client with a daemon.
+#
+# Keys are flattened to dotted paths by lwforge, so [[preflight]] entries become
+# preflight.0.type and so on. Array order survives the flattening, which matters
+# for actions and hooks.
+
+[product]
+name         = "DeadLetter"
+version      = "0.9.3"
+publisher    = "Locke Werks"
+description  = "Secure desktop email. Local-first, no telemetry."
+copyright    = "Copyright (c) 2026 Locke Werks"
+url          = "https://lockewerks.com/deadletter"
+# Stable across versions. Upgrade detection and the single-instance mutex key
+# off this, so changing it makes an upgrade look like a fresh product.
+upgrade_code = "9f2c1a3e-7b41-4c8e-9a2d-5e6f8b1c4d70"
+# No version component, so an upgrade keeps the same identity and taskbar pins
+# and toast notifications survive it.
+aumid        = "LockeWerks.DeadLetter"
+
+[install]
+scope     = "machine"
+dir       = "{ProgramFiles}\\DeadLetter"
+# on-demand: the wizard runs unelevated so the license and warnings are visible
+# before any UAC prompt, and per-user work happens in the invoking user's token.
+elevation = "on-demand"
+
+[ui]
+warning = "DeadLetter rebuilds your mail store index on first run. Existing mail is not modified."
+license_text = """
+MIT License
+
+Copyright (c) 2026 Locke Werks
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+
+# Theme overrides are optional. Omitting the block gives the Locke Werks
+# palette: #06060e background, #00cccc accent, 16px cards, 8px buttons.
+# [ui.theme]
+# accent = "#00cccc"
+
+[[preflight]]
+type = "os_build"
+min  = 17763
+fail = "Windows 10 version 1809 or later is required."
+
+[[preflight]]
+type = "free_disk_space"
+bytes = 420000000
+fail = "At least 400 MB of free space is required."
+
+[[preflight]]
+type = "process_not_running"
+name = "deadletter.exe"
+# Offer to close it through the Restart Manager rather than simply refusing.
+restart_manager = true
+fail = "Close DeadLetter before installing."
+
+[[actions]]
+type  = "shortcut"
+target = "{InstallDir}\\deadletter.exe"
+where  = "common_programs"
+name   = "DeadLetter"
+
+[[actions]]
+type = "arp"
+# DisplayName, Publisher, DisplayVersion and EstimatedSize are derived from
+# [product] and the payload rather than restated, so the ARP entry and the
+# winget manifest cannot disagree about what version this is.
+quiet_uninstall = true
+
+[[hooks.post_install]]
+run    = "payload:deadletterd.exe"
+args   = ["--register"]
+# Pinned. The binary must be a payload member and its digest must match, and the
+# config lives inside the Authenticode-covered region, so changing either the
+# hash or the binary it names invalidates the signature.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expect_exit = [0]
+vital = false

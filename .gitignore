@@ -18,11 +18,12 @@ compile_commands.json
 *.lib
 *.idb
 
-# Signing inputs. metadata.json is generated from metadata.json.in so the
-# certificate profile lives in exactly one place and cannot drift the way it did
-# across DeadLetter, MCPmcp, MTGSim and specterpoint.
+# Generated from metadata.json.in plus signing.env, so the certificate profile
+# lives in exactly one place and cannot drift the way it did across DeadLetter,
+# MCPmcp, MTGSim and specterpoint. signing.env itself IS tracked: it holds
+# account and profile names, which are configuration, not credentials.
 signing/metadata.json
-signing/*.env
+signing/*.local.env
 *.pfx
 *.snk
 
