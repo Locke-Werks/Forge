@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,72 @@ void flatten(const toml::node& node, const std::string& prefix, Config& out)
         // them silently would hide a typo in a key name.
         out.set(prefix, "");
     }
+}
+
+/// Fills in or verifies the sha256 of every hook against the payload.
+///
+/// `sha256 = "auto"` is substituted with the real digest. An explicit digest is
+/// compared and a mismatch fails the build. Hand-maintaining these is how a
+/// pinned hash quietly stops matching the binary it names, at which point the
+/// stub refuses to run the hook on a machine where nobody can see why.
+int resolve_hook_digests(Config& config, const std::map<std::string, Sha256>& digests)
+{
+    static const char* kPhases[] = {"hooks.post_extract", "hooks.pre_register",
+                                    "hooks.post_install", "hooks.pre_uninstall",
+                                    "hooks.post_uninstall"};
+
+    for (const char* phase : kPhases)
+    {
+        const size_t count = config.array_size(phase);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const std::string prefix = std::string(phase) + "." + std::to_string(i) + ".";
+            const std::string run = std::string(config.get(prefix + "run"));
+            if (run.empty())
+            {
+                continue;
+            }
+
+            constexpr std::string_view kPayload = "payload:";
+            if (run.compare(0, kPayload.size(), kPayload) != 0)
+            {
+                return fail(prefix + "run must start with payload: (got \"" + run + "\")");
+            }
+
+            std::string relative = run.substr(kPayload.size());
+            for (char& c : relative)
+            {
+                if (c == '/')
+                {
+                    c = '\\';
+                }
+            }
+
+            const auto found = digests.find(relative);
+            if (found == digests.end())
+            {
+                return fail(prefix + "run names \"" + relative +
+                            "\", which is not in the payload");
+            }
+
+            const std::string actual = to_hex(found->second);
+            const std::string declared = std::string(config.get(prefix + "sha256"));
+
+            if (declared.empty() || declared == "auto")
+            {
+                config.set(prefix + "sha256", actual);
+                std::printf("  hook      %s -> %s\n", relative.c_str(),
+                            actual.substr(0, 16).c_str());
+            }
+            else if (declared != actual)
+            {
+                return fail(prefix + "sha256 does not match " + relative + "\n" +
+                            "  declared " + declared + "\n" + "  actual   " + actual +
+                            "\n  set it to \"auto\" to have lwforge fill it in");
+            }
+        }
+    }
+    return 0;
 }
 
 struct Args
@@ -341,18 +408,17 @@ int cmd_build(int argc, wchar_t** argv)
     }
 
     // 5. Build the container at the offset it will actually occupy.
-    std::vector<uint8_t> config_blob;
-    if (Status s = config.encode(config_blob); !s)
-    {
-        return fail(s);
-    }
-
     ContainerWriter writer(CompressAlgo::Lzms);
-    writer.set_config(config_blob);
     if (args.dev)
     {
         writer.set_flags(kFlagDevBuild);
     }
+
+    // Payload digests, keyed by normalised relative path. Hook pinning is
+    // resolved against these before the config is encoded, so a hook whose
+    // digest does not match the file it names fails the BUILD rather than
+    // failing on a customer machine where nobody can read the message.
+    std::map<std::string, Sha256> digests;
 
     std::vector<fs::path> files;
     if (Status s = collect_payload(args.payload, files); !s)
@@ -385,6 +451,12 @@ int cmd_build(int argc, wchar_t** argv)
         {
             return fail(s);
         }
+        Sha256 digest{};
+        if (Status s = sha256(uninstaller, digest); !s)
+        {
+            return fail(s);
+        }
+        digests[".lw\\uninstall.exe"] = digest;
     }
 
     const fs::path payload_root(args.payload);
@@ -398,12 +470,39 @@ int cmd_build(int argc, wchar_t** argv)
         }
         raw_total += contents.size();
 
-        const std::string relative = fs::relative(file, payload_root, ec).string();
+        std::string relative = fs::relative(file, payload_root, ec).string();
         if (Status s = writer.add_file(relative, contents); !s)
         {
             return fail(s);
         }
+
+        Sha256 digest{};
+        if (Status s = sha256(contents, digest); !s)
+        {
+            return fail(s);
+        }
+        for (char& c : relative)
+        {
+            if (c == '/')
+            {
+                c = '\\';
+            }
+        }
+        digests[relative] = digest;
     }
+
+    // Resolve hook pinning now that every payload digest is known.
+    if (const int rc = resolve_hook_digests(config, digests); rc != 0)
+    {
+        return rc;
+    }
+
+    std::vector<uint8_t> config_blob;
+    if (Status s = config.encode(config_blob); !s)
+    {
+        return fail(s);
+    }
+    writer.set_config(config_blob);
 
     std::vector<uint8_t> blob;
     if (Status s = writer.build(layout.payload_end, blob); !s)

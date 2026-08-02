@@ -46,6 +46,19 @@ struct InstallRecord
     std::wstring arp_key;                 // subkey under the Uninstall path
     Scope scope = Scope::Machine;
 
+    /// The uninstall hooks, copied out of the install config.
+    ///
+    /// They have to travel here because the uninstaller is a payload-free copy
+    /// of the stub and has no container to read. That is a real reduction in
+    /// guarantee and is worth stating plainly: install hooks are pinned by a
+    /// config inside the Authenticode-covered region, whereas uninstall hooks
+    /// are pinned by a file in the install directory, protected by that
+    /// directory's ACL rather than by the signature. For a per-machine install
+    /// under Program Files that means administrator rights; for a per-user
+    /// install it means the user's own account, which is the same account the
+    /// hook would run as anyway.
+    Config hooks;
+
     Status save(const std::wstring& install_dir) const;
     Status load(const std::wstring& install_dir);
 };

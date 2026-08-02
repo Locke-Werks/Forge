@@ -10,6 +10,7 @@
 
 #include <algorithm>
 
+#include "hooks.h"
 #include "lwi/win_file.h"
 
 namespace lwi::stub
@@ -184,6 +185,14 @@ Status InstallRecord::save(const std::wstring& install_dir) const
         manifest.set("shortcuts." + std::to_string(i), to_utf8(shortcuts[i]));
     }
 
+    // Uninstall hooks keep their original key names so the loaded manifest can
+    // be handed straight to run_hooks without a translation step that could
+    // disagree with the installer's own reading of the same config.
+    for (const auto& [key, value] : hooks.entries())
+    {
+        manifest.set(key, value);
+    }
+
     std::vector<uint8_t> blob;
     if (Status s = manifest.encode(blob); !s)
     {
@@ -229,6 +238,14 @@ Status InstallRecord::load(const std::wstring& install_dir)
     read_list("files", files);
     read_list("dirs", directories);
     read_list("shortcuts", shortcuts);
+
+    for (const auto& [key, value] : manifest.entries())
+    {
+        if (key.rfind("hooks.", 0) == 0)
+        {
+            hooks.set(key, value);
+        }
+    }
 
     return Status::ok();
 }
@@ -416,6 +433,39 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         total_bytes += contents.size();
     }
 
+    // Files are on disk. This is the first point a product's own code can run.
+    {
+        std::vector<HookOutcome> hook_outcomes;
+        const bool ok = run_hooks(Phase::PostExtract, config, plan, hook_outcomes);
+        for (const HookOutcome& outcome : hook_outcomes)
+        {
+            if (!outcome.ok && warnings != nullptr)
+            {
+                warnings->push_back("hook " + outcome.id + ": " + outcome.detail);
+            }
+        }
+        if (!ok)
+        {
+            return Status::error(Code::IoError, "a required post_extract hook failed");
+        }
+    }
+
+    {
+        std::vector<HookOutcome> hook_outcomes;
+        const bool ok = run_hooks(Phase::PreRegister, config, plan, hook_outcomes);
+        for (const HookOutcome& outcome : hook_outcomes)
+        {
+            if (!outcome.ok && warnings != nullptr)
+            {
+                warnings->push_back("hook " + outcome.id + ": " + outcome.detail);
+            }
+        }
+        if (!ok)
+        {
+            return Status::error(Code::IoError, "a required pre_register hook failed");
+        }
+    }
+
     // Shortcuts. Created from the declarative action list, and every one that
     // lands is recorded so uninstall removes exactly these and nothing else.
     const size_t action_count = config.array_size("actions");
@@ -473,9 +523,33 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         return s;
     }
 
+    for (const auto& [key, value] : config.entries())
+    {
+        if (key.rfind("hooks.pre_uninstall", 0) == 0 || key.rfind("hooks.post_uninstall", 0) == 0)
+        {
+            record.hooks.set(key, value);
+        }
+    }
+
     if (Status s = record.save(plan.install_dir); !s)
     {
         return s;
+    }
+
+    {
+        std::vector<HookOutcome> hook_outcomes;
+        const bool ok = run_hooks(Phase::PostInstall, config, plan, hook_outcomes);
+        for (const HookOutcome& outcome : hook_outcomes)
+        {
+            if (!outcome.ok && warnings != nullptr)
+            {
+                warnings->push_back("hook " + outcome.id + ": " + outcome.detail);
+            }
+        }
+        if (!ok)
+        {
+            return Status::error(Code::IoError, "a required post_install hook failed");
+        }
     }
 
     if (progress)
@@ -491,6 +565,19 @@ Status run_uninstall(const std::wstring& install_dir)
     if (Status s = record.load(install_dir); !s)
     {
         return s;
+    }
+
+    InstallPlan plan;
+    plan.install_dir = install_dir;
+    plan.scope = record.scope;
+
+    {
+        std::vector<HookOutcome> hook_outcomes;
+        // Not fatal. Refusing to uninstall because the product's own cleanup
+        // hook failed leaves the user with something they cannot remove, which
+        // is worse than removing it with the cleanup half done.
+        std::vector<HookOutcome> ignored;
+        run_hooks(Phase::PreUninstall, record.hooks, plan, ignored);
     }
 
     for (const std::wstring& shortcut : record.shortcuts)

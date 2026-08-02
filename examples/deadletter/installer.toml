@@ -89,11 +89,16 @@ type = "arp"
 quiet_uninstall = true
 
 [[hooks.post_install]]
-run    = "payload:deadletterd.exe"
-args   = ["--register"]
-# Pinned. The binary must be a payload member and its digest must match, and the
-# config lives inside the Authenticode-covered region, so changing either the
-# hash or the binary it names invalidates the signature.
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+id     = "register_daemon"
+run    = "payload:bin\\deadletterd.exe"
+args   = ["cmd"]
+# "auto" makes lwforge fill in the real digest at build time and print it. An
+# explicit digest is verified instead, and a mismatch fails the build.
+#
+# Pinning is what ties a hook to one specific set of bytes: the config lives
+# inside the Authenticode-covered region, so changing either the digest or the
+# binary it names invalidates the installer's signature.
+sha256 = "auto"
 expect_exit = [0]
+timeout_ms = 30000
 vital = false
