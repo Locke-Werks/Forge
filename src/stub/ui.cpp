@@ -111,6 +111,13 @@ bool Wizard::init(HINSTANCE instance, const Config& config, const Theme& theme, 
     // line-height 1.7 on body copy, matching the brand's web stylesheet.
     res_->body->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, 14.0f * 1.7f, 14.0f * 1.35f);
 
+    // Button labels are centred in both axes so the label can be drawn into the
+    // button rectangle directly instead of against a hand-computed baseline
+    // that drifts every time the metrics change.
+    res_->button->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    res_->button->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -121,8 +128,9 @@ bool Wizard::init(HINSTANCE instance, const Config& config, const Theme& theme, 
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
     RegisterClassExW(&wc);
 
-    const UINT dpi = GetDpiForSystem();
-    dpi_scale_ = static_cast<float>(dpi) / 96.0f;
+    // GetDpiForSystem is only the starting point. The window may open on a
+    // monitor with a different scale, and WM_DPICHANGED updates this.
+    dpi_scale_ = static_cast<float>(GetDpiForSystem()) / 96.0f;
 
     const int width = static_cast<int>(kWindowWidth * dpi_scale_);
     const int height = static_cast<int>(kWindowHeight * dpi_scale_);
@@ -131,15 +139,31 @@ bool Wizard::init(HINSTANCE instance, const Config& config, const Theme& theme, 
 
     const std::wstring caption = product_ + L" Setup";
 
-    // WS_OVERLAPPEDWINDOW keeps WS_THICKFRAME and WS_CAPTION, which is what DWM
-    // requires before it will round the corners or draw a shadow. The frame is
-    // hidden in WM_NCCALCSIZE, not removed from the style.
+    // WS_THICKFRAME and WS_CAPTION both stay. DWM requires exactly those styles
+    // before it will round the corners or draw a shadow, so removing
+    // WS_THICKFRAME to prevent resizing puts the window in the "cannot be
+    // rounded" bucket and costs the shadow too. Resizing is prevented instead
+    // by WM_NCHITTEST, which never returns a resize border, and the frame is
+    // hidden by WM_NCCALCSIZE rather than by dropping the style.
     hwnd_ = CreateWindowExW(0, kWindowClass, caption.c_str(),
-                            WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME), x, y, width,
+                            WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_MINIMIZEBOX), x, y, width,
                             height, nullptr, nullptr, instance, this);
     if (hwnd_ == nullptr)
     {
         return false;
+    }
+
+    // The window may have opened on a monitor whose scale differs from the
+    // system one, in which case it was created at the wrong size. Re-measure
+    // against the window itself and correct before it is shown, so nothing
+    // flashes at the wrong size.
+    const float window_scale = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
+    if (window_scale != dpi_scale_)
+    {
+        dpi_scale_ = window_scale;
+        SetWindowPos(hwnd_, nullptr, 0, 0, static_cast<int>(kWindowWidth * dpi_scale_),
+                     static_cast<int>(kWindowHeight * dpi_scale_),
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     apply_window_attributes();
@@ -160,6 +184,13 @@ void Wizard::apply_window_attributes()
 
     const DWORD corner = kDwmCornerRound;
     DwmSetWindowAttribute(hwnd_, kDwmWindowCornerPreference, &corner, sizeof(corner));
+
+    // Force a frame recalculation. The non-client area is computed once during
+    // CreateWindowEx, and a WM_NCCALCSIZE handler installed by that same call
+    // does not retroactively apply to it. Without this the window keeps a
+    // standard caption bar and the custom frame silently does nothing.
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 int Wizard::run()
@@ -423,6 +454,16 @@ bool Wizard::create_device_resources()
         return false;
     }
 
+    // Pin the render target to 96 dpi so GetSize() reports PIXELS.
+    //
+    // By default a render target inherits the system DPI and reports its size
+    // in DIPs, which means the scale is applied once by D2D and once again by
+    // the transform below: the layout is computed against a width that is not
+    // the width being drawn, and the composition overflows the window. Owning
+    // the scaling in exactly one place is what makes a fixed 640x520 design
+    // land correctly at 100, 125, 150 and 175 percent.
+    res_->target->SetDpi(96.0f, 96.0f);
+
     // Grayscale rather than ClearType. Text inside a PushLayer clip silently
     // downgrades to grayscale unless the layer is initialised for ClearType, so
     // picking grayscale globally is what makes the clipped and unclipped text
@@ -445,9 +486,14 @@ void Wizard::discard_device_resources()
 void Wizard::layout_hit_regions(float width, float height)
 {
     rc_close_ = D2D1::RectF(width - 44.0f, 12.0f, width - 16.0f, 40.0f);
-    rc_license_ = D2D1::RectF(32.0f, 168.0f, width - 32.0f, height - 116.0f);
-    rc_checkbox_ = D2D1::RectF(32.0f, height - 100.0f, 52.0f, height - 80.0f);
-    rc_primary_ = D2D1::RectF(width - 192.0f, height - 62.0f, width - 32.0f, height - 22.0f);
+
+    // The warning sits between the card and the checkbox and gets its own band.
+    // Overlapping it onto the card made a two-line warning unreadable against
+    // the license text behind it.
+    const float warning_band = warning_.empty() ? 0.0f : 40.0f;
+    rc_license_ = D2D1::RectF(32.0f, 168.0f, width - 32.0f, height - 108.0f - warning_band);
+    rc_checkbox_ = D2D1::RectF(32.0f, height - 94.0f, 52.0f, height - 74.0f);
+    rc_primary_ = D2D1::RectF(width - 192.0f, height - 60.0f, width - 32.0f, height - 20.0f);
 }
 
 void Wizard::paint()
@@ -460,9 +506,18 @@ void Wizard::paint()
     ID2D1HwndRenderTarget* rt = res_->target.Get();
     ID2D1SolidColorBrush* brush = res_->brush.Get();
 
-    const D2D1_SIZE_F pixel_size = rt->GetSize();
-    const float width = pixel_size.width / dpi_scale_;
-    const float height = pixel_size.height / dpi_scale_;
+    // GetClientRect, not ID2D1RenderTarget::GetSize. GetSize reports DIPs
+    // against whatever DPI the target carries, so combining it with our own
+    // scale transform applies the scale twice and the layout overflows the
+    // window. GetClientRect is unambiguously pixels.
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const float width = static_cast<float>(client.right - client.left) / dpi_scale_;
+    const float height = static_cast<float>(client.bottom - client.top) / dpi_scale_;
+    if (width <= 0.0f || height <= 0.0f)
+    {
+        return;
+    }
 
     layout_hit_regions(width, height);
 
@@ -479,6 +534,39 @@ void Wizard::paint()
                       D2D1_DRAW_TEXT_OPTIONS_CLIP);
     };
 
+    // Letter-spaced text. The brand tracks its uppercase display type: 0.2em on
+    // eyebrows, 0.15em on headings, 0.1em on buttons. Character spacing is only
+    // settable on IDWriteTextLayout1, per text range, not on a text format, so
+    // tracked strings need a layout per draw rather than a one-time format
+    // tweak. Without it the headings read as ordinary bold text, not as the
+    // brand's.
+    const auto tracked = [&](std::wstring_view s, IDWriteTextFormat* format,
+                             const D2D1_RECT_F& rect, uint32_t color, float em, float font_size) {
+        if (s.empty())
+        {
+            return;
+        }
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(res_->dwrite->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), format,
+                                                  rect.right - rect.left, rect.bottom - rect.top,
+                                                  layout.GetAddressOf())))
+        {
+            text(s, format, rect, color);
+            return;
+        }
+
+        ComPtr<IDWriteTextLayout1> layout1;
+        if (SUCCEEDED(layout.As(&layout1)))
+        {
+            const DWRITE_TEXT_RANGE range{0, static_cast<UINT32>(s.size())};
+            layout1->SetCharacterSpacing(0.0f, font_size * em, 0.0f, range);
+        }
+
+        set(color);
+        rt->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), brush,
+                           D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    };
+
     const auto fill_round = [&](const D2D1_RECT_F& rect, float radius, uint32_t color) {
         set(color);
         rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush);
@@ -491,13 +579,14 @@ void Wizard::paint()
 
     // Header. The "//" prefix is a recurring mark in the Locke Werks and
     // Specter Point systems and carries into the installer.
-    text(L"// INSTALL", res_->eyebrow.Get(), D2D1::RectF(32.0f, 60.0f, width - 32.0f, 80.0f),
-         theme_.accent);
+    tracked(L"// INSTALL", res_->eyebrow.Get(), D2D1::RectF(32.0f, 60.0f, width - 32.0f, 82.0f),
+            theme_.accent, 0.20f, 11.0f);
 
     std::wstring heading = product_;
     std::transform(heading.begin(), heading.end(), heading.begin(),
                    [](wchar_t c) { return static_cast<wchar_t>(towupper(c)); });
-    text(heading, res_->title.Get(), D2D1::RectF(32.0f, 84.0f, width - 32.0f, 124.0f), theme_.text);
+    tracked(heading, res_->title.Get(), D2D1::RectF(32.0f, 84.0f, width - 32.0f, 126.0f),
+            theme_.text, 0.15f, 26.0f);
 
     if (!description_.empty())
     {
@@ -531,7 +620,8 @@ void Wizard::paint()
         if (!warning_.empty())
         {
             text(warning_, res_->small_text.Get(),
-                 D2D1::RectF(32.0f, height - 132.0f, width - 32.0f, height - 108.0f),
+                 D2D1::RectF(32.0f, rc_license_.bottom + 10.0f, width - 32.0f,
+                             rc_checkbox_.top - 6.0f),
                  theme_.error);
         }
 
@@ -548,7 +638,9 @@ void Wizard::paint()
                          2.0f);
         }
         text(L"I accept the license terms", res_->small_text.Get(),
-             D2D1::RectF(62.0f, height - 99.0f, width - 220.0f, height - 78.0f), theme_.text_body);
+             D2D1::RectF(rc_checkbox_.right + 10.0f, rc_checkbox_.top + 1.0f,
+                         rc_primary_.left - 12.0f, rc_checkbox_.bottom + 4.0f),
+             theme_.text_body);
 
         // Primary button. Disabled until the box is ticked, and it looks it.
         const uint32_t edge = accepted_ ? (hover_primary_ ? theme_.accent : theme_.border_hover)
@@ -558,10 +650,8 @@ void Wizard::paint()
             fill_round(rc_primary_, theme_.radius_button, theme_.accent_soft);
         }
         stroke_round(rc_primary_, theme_.radius_button, edge);
-        text(L"INSTALL", res_->button.Get(),
-             D2D1::RectF(rc_primary_.left, rc_primary_.top + 13.0f, rc_primary_.right,
-                         rc_primary_.bottom),
-             accepted_ ? theme_.accent : theme_.text_faint);
+        tracked(L"INSTALL", res_->button.Get(), rc_primary_,
+                accepted_ ? theme_.accent : theme_.text_faint, 0.10f, 12.0f);
         break;
     }
 
@@ -606,10 +696,7 @@ void Wizard::paint()
                  theme_.text_faint);
         }
         stroke_round(rc_primary_, theme_.radius_button, theme_.border_hover);
-        text(L"CLOSE", res_->button.Get(),
-             D2D1::RectF(rc_primary_.left, rc_primary_.top + 13.0f, rc_primary_.right,
-                         rc_primary_.bottom),
-             theme_.accent);
+        tracked(L"CLOSE", res_->button.Get(), rc_primary_, theme_.accent, 0.10f, 12.0f);
         break;
     }
 
@@ -625,10 +712,7 @@ void Wizard::paint()
         text(message, res_->small_text.Get(),
              D2D1::RectF(32.0f, 212.0f, width - 32.0f, height - 90.0f), theme_.text_body);
         stroke_round(rc_primary_, theme_.radius_button, theme_.border_hover);
-        text(L"CLOSE", res_->button.Get(),
-             D2D1::RectF(rc_primary_.left, rc_primary_.top + 13.0f, rc_primary_.right,
-                         rc_primary_.bottom),
-             theme_.text_body);
+        tracked(L"CLOSE", res_->button.Get(), rc_primary_, theme_.text_body, 0.10f, 12.0f);
         break;
     }
     }
