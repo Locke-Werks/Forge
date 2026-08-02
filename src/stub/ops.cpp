@@ -10,6 +10,7 @@
 
 #include <algorithm>
 
+#include "actions.h"
 #include "hooks.h"
 #include "lwi/win_file.h"
 
@@ -192,6 +193,10 @@ Status InstallRecord::save(const std::wstring& install_dir) const
     {
         manifest.set(key, value);
     }
+    for (const auto& [key, value] : undo.entries())
+    {
+        manifest.set("undo." + key, value);
+    }
 
     std::vector<uint8_t> blob;
     if (Status s = manifest.encode(blob); !s)
@@ -244,6 +249,10 @@ Status InstallRecord::load(const std::wstring& install_dir)
         if (key.rfind("hooks.", 0) == 0)
         {
             hooks.set(key, value);
+        }
+        else if (key.rfind("undo.", 0) == 0)
+        {
+            undo.set(key.substr(5), value);
         }
     }
 
@@ -518,6 +527,11 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         }
     }
 
+    if (Status s = apply_actions(config, plan, record, warnings); !s)
+    {
+        return s;
+    }
+
     if (Status s = write_arp(plan, total_bytes, record); !s)
     {
         return s;
@@ -598,6 +612,8 @@ Status run_uninstall(const std::wstring& install_dir)
     {
         RemoveDirectoryW(long_path(install_dir + L"\\" + dir).c_str());
     }
+
+    revert_actions(record);
 
     if (!record.arp_key.empty())
     {

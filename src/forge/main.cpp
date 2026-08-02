@@ -105,6 +105,49 @@ void flatten(const toml::node& node, const std::string& prefix, Config& out)
     }
 }
 
+/// Rejects control characters in config values.
+///
+/// TOML basic strings process backslash escapes, so "C:\bin" is C, colon,
+/// BACKSPACE, "in" and "C:\temp" hides a tab. Windows paths are the most common
+/// thing anyone puts in this file, which makes it the most common way to author
+/// a config that is silently wrong: the installer then creates a shortcut or a
+/// PATH entry pointing somewhere that cannot exist, and nothing complains.
+///
+/// The fix is a literal string ('C:\bin') or a doubled backslash, and the error
+/// says so rather than leaving the author to discover it.
+int reject_control_characters(const Config& config)
+{
+    for (const auto& [key, value] : config.entries())
+    {
+        // License and description text legitimately contain newlines and tabs.
+        if (key == "ui.license_text" || key == "ui.warning" || key == "product.description")
+        {
+            continue;
+        }
+
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(value[i]);
+            if (c >= 0x20 || c == '\n' || c == '\r')
+            {
+                continue;
+            }
+
+            const char* name = c == '\b'   ? "\\b (backspace)"
+                               : c == '\t' ? "\\t (tab)"
+                               : c == '\f' ? "\\f (form feed)"
+                                           : "a control character";
+            return fail(key + " contains " + std::string(name) + " at offset " +
+                        std::to_string(i) +
+                        ".\n  This is almost always a Windows path in a TOML basic string:"
+                        "\n  \"C:\\bin\" is C, colon, backspace, \"in\"."
+                        "\n  Use a literal string 'C:\\bin' or double the backslash "
+                        "\"C:\\\\bin\".");
+        }
+    }
+    return 0;
+}
+
 /// Fills in or verifies the sha256 of every hook against the payload.
 ///
 /// `sha256 = "auto"` is substituted with the real digest. An explicit digest is
@@ -320,6 +363,11 @@ int cmd_build(int argc, wchar_t** argv)
                     std::to_string(e.source().begin.column);
         }
         return fail(to_utf8(args.config) + where + ": " + std::string(e.description()));
+    }
+
+    if (const int rc = reject_control_characters(config); rc != 0)
+    {
+        return rc;
     }
 
     const std::string product = std::string(config.get("product.name"));

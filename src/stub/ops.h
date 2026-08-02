@@ -59,6 +59,14 @@ struct InstallRecord
     /// hook would run as anyway.
     Config hooks;
 
+    /// How to reverse everything that is not a file: registry values and
+    /// environment entries, each recorded with what was there before.
+    ///
+    /// Restoring a captured prior value is the only correct undo. Deleting
+    /// unconditionally destroys a setting the machine already had, and leaving
+    /// it alone orphans one the install created.
+    Config undo;
+
     Status save(const std::wstring& install_dir) const;
     Status load(const std::wstring& install_dir);
 };
