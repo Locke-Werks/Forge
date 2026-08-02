@@ -3,14 +3,13 @@
 #include <shellapi.h> // CommandLineToArgvW
 #include <shlobj.h>
 
-#include <cstdio>
-#include <functional>
 #include <string>
 #include <vector>
 
 #include "lwi/config.h"
 #include "lwi/container.h"
 #include "lwi/win_file.h"
+#include "ops.h"
 #include "theme.h"
 #include "ui.h"
 
@@ -31,7 +30,15 @@ struct Options
 {
     bool silent = false;
     bool check_only = false;
+    bool uninstall = false;
     std::wstring dir;
+
+    // Set on the temp-directory copy of the uninstaller. It waits for the
+    // original to exit, then removes the directory the original was running
+    // from. A process cannot unlink its own running image, so the last step of
+    // an uninstall has to be issued from somewhere else.
+    std::wstring finish_dir;
+    DWORD wait_for_pid = 0;
 };
 
 Options parse_command_line()
@@ -47,7 +54,7 @@ Options parse_command_line()
 
     for (int i = 1; i < count; ++i)
     {
-        std::wstring arg = argv[i];
+        const std::wstring arg = argv[i];
         std::wstring upper = arg;
         for (wchar_t& c : upper)
         {
@@ -65,6 +72,15 @@ Options parse_command_line()
         else if (upper == L"--CHECK-ONLY")
         {
             options.check_only = true;
+        }
+        else if (upper == L"/UNINSTALL" || upper == L"--UNINSTALL")
+        {
+            options.uninstall = true;
+        }
+        else if (upper == L"--FINISH-UNINSTALL" && i + 2 < count)
+        {
+            options.finish_dir = argv[++i];
+            options.wait_for_pid = static_cast<DWORD>(_wtoi(argv[++i]));
         }
         else if (upper.rfind(L"/D=", 0) == 0 || upper.rfind(L"/DIR=", 0) == 0)
         {
@@ -121,79 +137,6 @@ std::wstring expand_tokens(const std::wstring& input)
     return out;
 }
 
-Status ensure_directory(const std::wstring& path)
-{
-    const std::wstring full = long_path(path);
-    if (CreateDirectoryW(full.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        return Status::ok();
-    }
-    if (GetLastError() != ERROR_PATH_NOT_FOUND)
-    {
-        return Status::error(Code::IoError, win32_message("CreateDirectoryW", GetLastError()));
-    }
-
-    const size_t slash = path.find_last_of(L'\\');
-    if (slash == std::wstring::npos || slash < 3)
-    {
-        return Status::error(Code::IoError, "cannot create directory: " + to_utf8(path));
-    }
-    if (Status s = ensure_directory(path.substr(0, slash)); !s)
-    {
-        return s;
-    }
-    if (!CreateDirectoryW(full.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
-    {
-        return Status::error(Code::IoError, win32_message("CreateDirectoryW", GetLastError()));
-    }
-    return Status::ok();
-}
-
-/// Extracts every payload member into target_dir.
-///
-/// Each member is verified against the SHA-256 in the signed index before it
-/// becomes a file, inside ContainerReader::extract. A successful decompression
-/// is never taken as proof of integrity.
-Status extract_all(const ContainerReader& reader, const std::wstring& target_dir,
-                   const std::function<bool(size_t, size_t, const std::string&)>& progress)
-{
-    if (Status s = ensure_directory(target_dir); !s)
-    {
-        return s;
-    }
-
-    const std::vector<FileView>& files = reader.files();
-    for (size_t i = 0; i < files.size(); ++i)
-    {
-        if (progress && !progress(i, files.size(), files[i].path))
-        {
-            return Status::error(Code::Ok, "cancelled");
-        }
-
-        std::vector<uint8_t> contents;
-        if (Status s = reader.extract(i, contents); !s)
-        {
-            return s;
-        }
-
-        const std::wstring destination = target_dir + L"\\" + to_wide(files[i].path);
-        const size_t slash = destination.find_last_of(L'\\');
-        if (slash != std::wstring::npos)
-        {
-            if (Status s = ensure_directory(destination.substr(0, slash)); !s)
-            {
-                return s;
-            }
-        }
-
-        if (Status s = write_whole_file(destination, contents); !s)
-        {
-            return s;
-        }
-    }
-    return Status::ok();
-}
-
 void write_console(const std::string& text)
 {
     // A GUI-subsystem process has no console of its own, which makes writing
@@ -238,6 +181,143 @@ void write_console(const std::string& text)
     }
 }
 
+void remove_tree(const std::wstring& path)
+{
+    WIN32_FIND_DATAW find{};
+    const HANDLE handle = FindFirstFileW(long_path(path + L"\\*").c_str(), &find);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            const std::wstring name = find.cFileName;
+            if (name == L"." || name == L"..")
+            {
+                continue;
+            }
+            const std::wstring child = path + L"\\" + name;
+            if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                remove_tree(child);
+            }
+            else
+            {
+                SetFileAttributesW(long_path(child).c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(long_path(child).c_str());
+            }
+        } while (FindNextFileW(handle, &find));
+        FindClose(handle);
+    }
+    RemoveDirectoryW(long_path(path).c_str());
+}
+
+/// Relaunches a copy of this executable from the temp directory so it can
+/// delete the directory this one is running from.
+///
+/// A running image cannot be unlinked, so the final removal has to be issued by
+/// a process that does not live inside the doomed directory.
+/// MOVEFILE_DELAY_UNTIL_REBOOT would also work, but it needs administrator
+/// rights and leaves the product looking installed until the machine restarts.
+Status relaunch_to_finish(const std::wstring& self, const std::wstring& install_dir)
+{
+    wchar_t temp_dir[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, temp_dir) == 0)
+    {
+        return Status::error(Code::IoError, win32_message("GetTempPathW", GetLastError()));
+    }
+
+    wchar_t temp_file[MAX_PATH]{};
+    if (GetTempFileNameW(temp_dir, L"lwu", 0, temp_file) == 0)
+    {
+        return Status::error(Code::IoError, win32_message("GetTempFileNameW", GetLastError()));
+    }
+
+    std::wstring copy = temp_file;
+    copy += L".exe";
+    DeleteFileW(temp_file);
+
+    if (!CopyFileW(long_path(self).c_str(), long_path(copy).c_str(), FALSE))
+    {
+        return Status::error(Code::IoError, win32_message("CopyFileW", GetLastError()));
+    }
+
+    std::wstring command = L"\"" + copy + L"\" --finish-uninstall \"" + install_dir + L"\" " +
+                           std::to_wstring(GetCurrentProcessId());
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, temp_dir, &si, &pi))
+    {
+        return Status::error(Code::IoError, win32_message("CreateProcessW", GetLastError()));
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return Status::ok();
+}
+
+/// The install directory, given that the uninstaller runs from
+/// <InstallDir>\.lw\uninstall.exe. Two levels up.
+std::wstring install_dir_from_uninstaller(const std::wstring& self)
+{
+    size_t slash = self.find_last_of(L'\\');
+    if (slash == std::wstring::npos)
+    {
+        return {};
+    }
+    const std::wstring meta = self.substr(0, slash);
+    slash = meta.find_last_of(L'\\');
+    if (slash == std::wstring::npos)
+    {
+        return {};
+    }
+    return meta.substr(0, slash);
+}
+
+int run_uninstall_mode(const Options& options, const std::wstring& self)
+{
+    const std::wstring install_dir =
+        options.dir.empty() ? install_dir_from_uninstaller(self) : options.dir;
+    if (install_dir.empty())
+    {
+        return kExitFailure;
+    }
+
+    if (!options.silent)
+    {
+        const std::wstring prompt = L"Remove " + install_dir + L"?";
+        if (MessageBoxW(nullptr, prompt.c_str(), L"Uninstall", MB_ICONQUESTION | MB_OKCANCEL) !=
+            IDOK)
+        {
+            return kExitUserCancel;
+        }
+    }
+
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)))
+    {
+        return kExitFailure;
+    }
+    const Status s = run_uninstall(install_dir);
+    CoUninitialize();
+
+    if (!s)
+    {
+        if (options.silent)
+        {
+            write_console("lwi: " + s.message() + "\n");
+        }
+        else
+        {
+            MessageBoxW(nullptr, to_wide(s.message()).c_str(), L"Uninstall", MB_ICONERROR | MB_OK);
+        }
+        return kExitFailure;
+    }
+
+    // Everything is gone except this running image and the directory holding it.
+    relaunch_to_finish(self, install_dir);
+    return kExitSuccess;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
@@ -254,6 +334,35 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     if (Status s = self_path(self); !s)
     {
         return kExitFailure;
+    }
+
+    // The temp-directory copy finishing an uninstall. It carries no container
+    // and touches nothing but the directory it was told to remove.
+    if (!options.finish_dir.empty())
+    {
+        if (options.wait_for_pid != 0)
+        {
+            const HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, options.wait_for_pid);
+            if (parent != nullptr)
+            {
+                WaitForSingleObject(parent, 30000);
+                CloseHandle(parent);
+            }
+        }
+        remove_tree(options.finish_dir);
+
+        // Schedule this copy's own removal. Best effort: MOVEFILE_DELAY_UNTIL_
+        // REBOOT needs administrator rights, so an unelevated per-user
+        // uninstall leaves one small file in %TEMP% until the directory is
+        // cleaned. NSIS has the same residue for the same reason. Leaking a
+        // file beats leaving the product's directory behind.
+        MoveFileExW(long_path(self).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        return kExitSuccess;
+    }
+
+    if (options.uninstall)
+    {
+        return run_uninstall_mode(options, self);
     }
 
     std::vector<uint8_t> image;
@@ -295,15 +404,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
                       to_wide(config.get("product.name", "Application"));
     }
 
+    const InstallPlan plan = plan_from_config(config, install_dir);
+
     if (options.check_only)
     {
         std::string report;
         report += "product     " + std::string(config.get("product.name")) + " " +
                   std::string(config.get("product.version")) + "\n";
         report += "publisher   " + std::string(config.get("product.publisher")) + "\n";
+        report += "scope       " +
+                  std::string(plan.scope == Scope::Machine ? "machine" : "user") + "\n";
         report += "install dir " + to_utf8(install_dir) + "\n";
         report += "payload     " + std::to_string(reader.files().size()) + " files\n";
         report += "config      " + std::to_string(config.entries().size()) + " keys\n";
+        if (const std::wstring prior = installed_version(plan); !prior.empty())
+        {
+            report += "installed   " + to_utf8(prior) + " (this run would upgrade)\n";
+        }
         if (reader.is_dev_build())
         {
             report += "build       UNSIGNED DEV BUILD\n";
@@ -322,52 +439,82 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
         return kExitAlreadyRunning;
     }
 
-    if (options.silent)
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)))
     {
-        const Status s = extract_all(reader, install_dir, nullptr);
-        return s.is_ok() ? kExitSuccess : kExitFailure;
-    }
-
-    Wizard wizard;
-    const Theme theme = Theme::from_config(config);
-    if (!wizard.init(instance, config, theme, reader.is_dev_build()))
-    {
-        MessageBoxW(nullptr, L"Could not create the setup window.", L"Setup", MB_ICONERROR | MB_OK);
         return kExitFailure;
     }
-    wizard.set_install_dir(install_dir);
 
-    wizard.on_install([&] {
-        const Status s = extract_all(
-            reader, install_dir, [&](size_t index, size_t total, const std::string& path) {
-                if (wizard.cancelled())
-                {
-                    return false;
-                }
-                wizard.set_progress(static_cast<float>(index) / static_cast<float>(total),
-                                    to_wide(path));
-                return true;
-            });
+    int result = kExitSuccess;
 
-        if (wizard.cancelled())
+    if (options.silent)
+    {
+        std::vector<std::string> warnings;
+        const Status s = run_install(reader, config, plan, nullptr, &warnings);
+        for (const std::string& warning : warnings)
         {
-            wizard.finish_error(L"Installation was cancelled.");
+            write_console("lwi: warning: " + warning + "\n");
         }
-        else if (!s)
+        if (!s)
         {
-            wizard.finish_error(to_wide(s.message()));
+            write_console("lwi: " + s.message() + "\n");
         }
-        else
+        result = s.is_ok() ? kExitSuccess : kExitFailure;
+    }
+    else
+    {
+        Wizard wizard;
+        const Theme theme = Theme::from_config(config);
+        if (!wizard.init(instance, config, theme, reader.is_dev_build()))
         {
-            wizard.finish_ok();
+            MessageBoxW(nullptr, L"Could not create the setup window.", L"Setup",
+                        MB_ICONERROR | MB_OK);
+            CoUninitialize();
+            return kExitFailure;
         }
-    });
+        wizard.set_install_dir(install_dir);
 
-    const int code = wizard.run();
+        wizard.on_install([&] {
+            // COM apartments are per thread, and this thread creates shortcuts.
+            const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+
+            const Status s =
+                run_install(reader, config, plan, [&](float fraction, const std::wstring& status) {
+                    if (wizard.cancelled())
+                    {
+                        return false;
+                    }
+                    wizard.set_progress(fraction, status);
+                    return true;
+                });
+
+            if (com)
+            {
+                CoUninitialize();
+            }
+
+            if (wizard.cancelled())
+            {
+                wizard.finish_error(L"Installation was cancelled.");
+            }
+            else if (!s)
+            {
+                wizard.finish_error(to_wide(s.message()));
+            }
+            else
+            {
+                wizard.finish_ok();
+            }
+        });
+
+        result = wizard.run() == 0 ? kExitSuccess : kExitUserCancel;
+    }
+
+    CoUninitialize();
+
     if (mutex != nullptr)
     {
         ReleaseMutex(mutex);
         CloseHandle(mutex);
     }
-    return code == 0 ? kExitSuccess : kExitUserCancel;
+    return result;
 }

@@ -1,8 +1,8 @@
-# lwi
+# Forge
 
-A universal, extensible Windows installer. One signed stub, compiled once, plus
-a packaging tool that stamps a product's configuration and payload into a copy
-of it. Building an installer needs no C++ toolchain.
+LockeWerks Forge. A universal, extensible Windows installer: one signed stub,
+compiled once, plus a packaging tool that stamps a product's configuration and
+payload into a copy of it. Building an installer needs no C++ toolchain.
 
 ## What it is
 

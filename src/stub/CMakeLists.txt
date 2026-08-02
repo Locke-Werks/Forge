@@ -7,6 +7,7 @@ configure_file(
 add_executable(lwstub WIN32
     main.cpp
     ui.cpp
+    ops.cpp
     theme.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/stub.rc"
 )
@@ -23,8 +24,11 @@ target_link_libraries(lwstub PRIVATE
     windowscodecs
     shell32
     ole32
+    oleaut32
+    propsys      # PKEY_AppUserModel_ID and InitPropVariantFromString
     shlwapi
     comctl32
+    advapi32
 )
 
 lwi_apply_warnings(lwstub)

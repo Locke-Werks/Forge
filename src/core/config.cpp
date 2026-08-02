@@ -134,16 +134,20 @@ size_t Config::array_size(std::string_view prefix) const
         {
             continue;
         }
+        // The index runs to the next dot, or to the end of the key when the
+        // array holds scalars rather than tables. An array of strings flattens
+        // to args.0, args.1 with nothing after the number, so requiring a
+        // trailing dot silently reports every such array as empty.
         const size_t start = needle.size();
-        const size_t dot = e.first.find('.', start);
-        if (dot == std::string::npos)
+        size_t end = e.first.find('.', start);
+        if (end == std::string::npos)
         {
-            continue;
+            end = e.first.size();
         }
+
         uint64_t idx = 0;
-        const auto result =
-            std::from_chars(e.first.data() + start, e.first.data() + dot, idx);
-        if (result.ec == std::errc{} && result.ptr == e.first.data() + dot)
+        const auto result = std::from_chars(e.first.data() + start, e.first.data() + end, idx);
+        if (result.ec == std::errc{} && result.ptr == e.first.data() + end)
         {
             indices.insert(idx);
         }

@@ -1,0 +1,529 @@
+#include "ops.h"
+
+#include <windows.h>
+
+#include <objbase.h>
+#include <propkey.h>
+#include <propvarutil.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+
+#include <algorithm>
+
+#include "lwi/win_file.h"
+
+namespace lwi::stub
+{
+namespace
+{
+
+constexpr const wchar_t* kUninstallPath =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\";
+
+constexpr const wchar_t* kManifestName = L"install.manifest";
+
+std::wstring known_folder(REFKNOWNFOLDERID id)
+{
+    PWSTR path = nullptr;
+    if (FAILED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &path)))
+    {
+        return {};
+    }
+    std::wstring out(path);
+    CoTaskMemFree(path);
+    return out;
+}
+
+Status ensure_directory(const std::wstring& path)
+{
+    const std::wstring full = long_path(path);
+    if (CreateDirectoryW(full.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        return Status::ok();
+    }
+    if (GetLastError() != ERROR_PATH_NOT_FOUND)
+    {
+        return Status::error(Code::IoError, win32_message("CreateDirectoryW", GetLastError()));
+    }
+
+    const size_t slash = path.find_last_of(L'\\');
+    if (slash == std::wstring::npos || slash < 3)
+    {
+        return Status::error(Code::IoError, "cannot create directory: " + to_utf8(path));
+    }
+    if (Status s = ensure_directory(path.substr(0, slash)); !s)
+    {
+        return s;
+    }
+    if (!CreateDirectoryW(full.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+    {
+        return Status::error(Code::IoError, win32_message("CreateDirectoryW", GetLastError()));
+    }
+    return Status::ok();
+}
+
+HKEY scope_root(Scope scope)
+{
+    return scope == Scope::Machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+}
+
+/// KEY_WOW64_64KEY is passed deliberately and only here.
+///
+/// The Uninstall key inherits WOW64 redirection from HKLM\SOFTWARE, so a
+/// 32-bit view would put the entry somewhere Settings does not look. Most of
+/// the other keys an installer touches (App Paths, SOFTWARE\Classes,
+/// RegisteredApplications) are Shared on Windows 7 and later, where forcing a
+/// view invites the opposite error of assuming two views exist.
+Status reg_create(HKEY root, const std::wstring& subkey, HKEY& out)
+{
+    const LSTATUS rc = RegCreateKeyExW(root, subkey.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                                       KEY_WRITE | KEY_WOW64_64KEY, nullptr, &out, nullptr);
+    if (rc != ERROR_SUCCESS)
+    {
+        return Status::error(Code::IoError,
+                             win32_message("RegCreateKeyExW", static_cast<DWORD>(rc)));
+    }
+    return Status::ok();
+}
+
+void reg_set_string(HKEY key, const wchar_t* name, const std::wstring& value)
+{
+    if (value.empty())
+    {
+        return;
+    }
+    RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+                   static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+}
+
+void reg_set_dword(HKEY key, const wchar_t* name, DWORD value)
+{
+    RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+}
+
+std::wstring today_stamp()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t buf[16]{};
+    swprintf_s(buf, L"%04u%02u%02u", st.wYear, st.wMonth, st.wDay);
+    return buf;
+}
+
+std::wstring quote(const std::wstring& s)
+{
+    return L"\"" + s + L"\"";
+}
+
+Status delete_tree_entry(const std::wstring& path)
+{
+    const std::wstring full = long_path(path);
+    if (DeleteFileW(full.c_str()))
+    {
+        return Status::ok();
+    }
+    const DWORD err = GetLastError();
+    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+    {
+        return Status::ok();
+    }
+
+    // Read-only files are ours to clear: we wrote them.
+    if (err == ERROR_ACCESS_DENIED)
+    {
+        SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (DeleteFileW(full.c_str()))
+        {
+            return Status::ok();
+        }
+    }
+
+    // Still locked, most often because the file is running or an antivirus
+    // scanner holds a handle. Defer rather than fail the whole uninstall.
+    MoveFileExW(full.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return Status::ok();
+}
+
+} // namespace
+
+InstallPlan plan_from_config(const Config& config, const std::wstring& install_dir_override)
+{
+    InstallPlan plan;
+    plan.scope = config.get("install.scope") == "user" ? Scope::User : Scope::Machine;
+    plan.product = to_wide(config.get("product.name", "Application"));
+    plan.version = to_wide(config.get("product.version"));
+    plan.publisher = to_wide(config.get("product.publisher", "Locke Werks"));
+    plan.upgrade_code = to_wide(config.get("product.upgrade_code"));
+    plan.aumid = to_wide(config.get("product.aumid"));
+    plan.url_about = to_wide(config.get("product.url"));
+    plan.install_dir = install_dir_override;
+    return plan;
+}
+
+Status InstallRecord::save(const std::wstring& install_dir) const
+{
+    // Reuses the config codec rather than inventing a second serialisation.
+    // One format means one parser and one set of bounds checks to get right.
+    Config manifest;
+    manifest.set("scope", scope == Scope::Machine ? "machine" : "user");
+    manifest.set("arp_key", to_utf8(arp_key));
+
+    manifest.set("files.count", std::to_string(files.size()));
+    for (size_t i = 0; i < files.size(); ++i)
+    {
+        manifest.set("files." + std::to_string(i), to_utf8(files[i]));
+    }
+    manifest.set("dirs.count", std::to_string(directories.size()));
+    for (size_t i = 0; i < directories.size(); ++i)
+    {
+        manifest.set("dirs." + std::to_string(i), to_utf8(directories[i]));
+    }
+    manifest.set("shortcuts.count", std::to_string(shortcuts.size()));
+    for (size_t i = 0; i < shortcuts.size(); ++i)
+    {
+        manifest.set("shortcuts." + std::to_string(i), to_utf8(shortcuts[i]));
+    }
+
+    std::vector<uint8_t> blob;
+    if (Status s = manifest.encode(blob); !s)
+    {
+        return s;
+    }
+
+    const std::wstring meta = install_dir + L"\\" + kMetaDir;
+    if (Status s = ensure_directory(meta); !s)
+    {
+        return s;
+    }
+    return write_whole_file(meta + L"\\" + kManifestName, blob);
+}
+
+Status InstallRecord::load(const std::wstring& install_dir)
+{
+    std::vector<uint8_t> blob;
+    const std::wstring path = install_dir + L"\\" + kMetaDir + L"\\" + kManifestName;
+    if (Status s = read_whole_file(path, blob); !s)
+    {
+        return Status::error(Code::IoError,
+                             "no install manifest at " + to_utf8(path) +
+                                 "; refusing to guess what to remove");
+    }
+
+    Config manifest;
+    if (Status s = manifest.decode(blob); !s)
+    {
+        return s;
+    }
+
+    scope = manifest.get("scope") == "user" ? Scope::User : Scope::Machine;
+    arp_key = to_wide(manifest.get("arp_key"));
+
+    const auto read_list = [&](const char* prefix, std::vector<std::wstring>& out) {
+        const int64_t count = manifest.get_int(std::string(prefix) + ".count", 0);
+        out.clear();
+        for (int64_t i = 0; i < count; ++i)
+        {
+            out.push_back(to_wide(manifest.get(std::string(prefix) + "." + std::to_string(i))));
+        }
+    };
+    read_list("files", files);
+    read_list("dirs", directories);
+    read_list("shortcuts", shortcuts);
+
+    return Status::ok();
+}
+
+namespace
+{
+
+Status write_arp(const InstallPlan& plan, uint64_t size_bytes, InstallRecord& record)
+{
+    // Keyed by product name rather than by a GUID. Settings shows either, and a
+    // readable key is one a support engineer can find without a lookup table.
+    record.arp_key = plan.product;
+
+    HKEY key = nullptr;
+    if (Status s = reg_create(scope_root(plan.scope), kUninstallPath + record.arp_key, key); !s)
+    {
+        return s;
+    }
+
+    const std::wstring uninstaller =
+        plan.install_dir + L"\\" + kMetaDir + L"\\" + kUninstallerName;
+
+    reg_set_string(key, L"DisplayName", plan.product);
+    reg_set_string(key, L"DisplayVersion", plan.version);
+    reg_set_string(key, L"Publisher", plan.publisher);
+    reg_set_string(key, L"InstallLocation", plan.install_dir);
+    reg_set_string(key, L"InstallDate", today_stamp());
+    reg_set_string(key, L"DisplayIcon", uninstaller + L",0");
+    reg_set_string(key, L"UninstallString", quote(uninstaller) + L" /uninstall");
+    // QuietUninstallString is what Intune, SCCM and winget actually invoke.
+    // Without it they fall back to UninstallString and get an interactive
+    // prompt in a session with no one to answer it.
+    reg_set_string(key, L"QuietUninstallString", quote(uninstaller) + L" /uninstall /S");
+    reg_set_string(key, L"URLInfoAbout", plan.url_about);
+
+    // EstimatedSize is in KILOBYTES. Written in bytes it reports a terabyte and
+    // looks like a bug in the product rather than in its installer.
+    reg_set_dword(key, L"EstimatedSize", static_cast<DWORD>(size_bytes / 1024));
+    reg_set_dword(key, L"NoModify", 1);
+    reg_set_dword(key, L"NoRepair", 1);
+
+    RegCloseKey(key);
+    return Status::ok();
+}
+
+Status create_shortcut(const std::wstring& link_path, const std::wstring& target,
+                       const std::wstring& working_dir, const std::wstring& aumid)
+{
+    IShellLinkW* link = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IShellLinkW, reinterpret_cast<void**>(&link));
+    if (FAILED(hr))
+    {
+        return Status::error(Code::IoError, hresult_message("CoCreateInstance(ShellLink)", hr));
+    }
+
+    // SetPath must point at a real, well-formed executable when the target is
+    // an .exe. Save resolves the target while writing the link, and a file with
+    // an .exe extension that is not a valid PE makes it fail outright with
+    // E_FAIL rather than degrade. A target that does not exist at all is fine,
+    // which is why this failure mode stays hidden until a payload is present.
+    link->SetPath(target.c_str());
+    link->SetWorkingDirectory(working_dir.c_str());
+
+    // No SetIconLocation. A shell link with no explicit icon already uses its
+    // target's first icon, so pointing it at the target is redundant and only
+    // adds another way for Save to fail.
+
+    // The AppUserModelID is what makes a taskbar pin and any toast notification
+    // survive an upgrade. It must carry no version component for that reason.
+    if (!aumid.empty())
+    {
+        IPropertyStore* store = nullptr;
+        if (SUCCEEDED(link->QueryInterface(IID_IPropertyStore, reinterpret_cast<void**>(&store))))
+        {
+            PROPVARIANT value{};
+            if (SUCCEEDED(InitPropVariantFromString(aumid.c_str(), &value)))
+            {
+                store->SetValue(PKEY_AppUserModel_ID, value);
+                store->Commit();
+                PropVariantClear(&value);
+            }
+            store->Release();
+        }
+    }
+
+    IPersistFile* file = nullptr;
+    hr = link->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&file));
+    if (SUCCEEDED(hr))
+    {
+        hr = file->Save(link_path.c_str(), TRUE);
+        file->Release();
+    }
+    link->Release();
+
+    if (FAILED(hr))
+    {
+        return Status::error(Code::IoError, hresult_message("IPersistFile::Save", hr) +
+                                                " (target " + to_utf8(target) + ")");
+    }
+    return Status::ok();
+}
+
+} // namespace
+
+std::wstring installed_version(const InstallPlan& plan)
+{
+    HKEY key = nullptr;
+    const std::wstring path = kUninstallPath + plan.product;
+    if (RegOpenKeyExW(scope_root(plan.scope), path.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &key) !=
+        ERROR_SUCCESS)
+    {
+        return {};
+    }
+
+    wchar_t buffer[128]{};
+    DWORD size = sizeof(buffer);
+    DWORD type = 0;
+    std::wstring version;
+    if (RegQueryValueExW(key, L"DisplayVersion", nullptr, &type,
+                         reinterpret_cast<BYTE*>(buffer), &size) == ERROR_SUCCESS &&
+        type == REG_SZ)
+    {
+        version = buffer;
+    }
+    RegCloseKey(key);
+    return version;
+}
+
+Status run_install(const ContainerReader& reader, const Config& config, const InstallPlan& plan,
+                   const ProgressFn& progress, std::vector<std::string>* warnings)
+{
+    InstallRecord record;
+    record.scope = plan.scope;
+
+    if (Status s = ensure_directory(plan.install_dir); !s)
+    {
+        return s;
+    }
+
+    const std::vector<FileView>& files = reader.files();
+    uint64_t total_bytes = 0;
+
+    for (size_t i = 0; i < files.size(); ++i)
+    {
+        const std::wstring relative = to_wide(files[i].path);
+        if (progress && !progress(static_cast<float>(i) / static_cast<float>(files.size()),
+                                  relative))
+        {
+            return Status::error(Code::InvalidArgument, "cancelled");
+        }
+
+        std::vector<uint8_t> contents;
+        if (Status s = reader.extract(i, contents); !s)
+        {
+            return s;
+        }
+
+        const std::wstring destination = plan.install_dir + L"\\" + relative;
+        const size_t slash = destination.find_last_of(L'\\');
+        if (slash != std::wstring::npos)
+        {
+            if (Status s = ensure_directory(destination.substr(0, slash)); !s)
+            {
+                return s;
+            }
+            const size_t rel_slash = relative.find_last_of(L'\\');
+            if (rel_slash != std::wstring::npos)
+            {
+                std::wstring dir = relative.substr(0, rel_slash);
+                if (std::find(record.directories.begin(), record.directories.end(), dir) ==
+                    record.directories.end())
+                {
+                    record.directories.push_back(dir);
+                }
+            }
+        }
+
+        if (Status s = write_whole_file(destination, contents); !s)
+        {
+            return s;
+        }
+
+        record.files.push_back(relative);
+        total_bytes += contents.size();
+    }
+
+    // Shortcuts. Created from the declarative action list, and every one that
+    // lands is recorded so uninstall removes exactly these and nothing else.
+    const size_t action_count = config.array_size("actions");
+    for (size_t i = 0; i < action_count; ++i)
+    {
+        const std::string prefix = "actions." + std::to_string(i) + ".";
+        if (config.get(prefix + "type") != "shortcut")
+        {
+            continue;
+        }
+
+        std::wstring target = to_wide(config.get(prefix + "target"));
+        const size_t token = target.find(L"{InstallDir}");
+        if (token != std::wstring::npos)
+        {
+            target.replace(token, wcslen(L"{InstallDir}"), plan.install_dir);
+        }
+
+        const std::string where = std::string(config.get(prefix + "where", "common_programs"));
+        std::wstring folder;
+        if (where == "desktop")
+        {
+            folder = known_folder(plan.scope == Scope::Machine ? FOLDERID_PublicDesktop
+                                                              : FOLDERID_Desktop);
+        }
+        else
+        {
+            folder = known_folder(plan.scope == Scope::Machine ? FOLDERID_CommonPrograms
+                                                              : FOLDERID_Programs);
+        }
+        if (folder.empty())
+        {
+            continue;
+        }
+
+        const std::wstring name = to_wide(config.get(prefix + "name", config.get("product.name")));
+        const std::wstring link = folder + L"\\" + name + L".lnk";
+
+        // A failed shortcut is not a failed install: the product is on disk and
+        // usable. It is still reported, because an install that quietly does
+        // not produce the Start Menu entry it was asked for looks to the user
+        // like an install that did not happen.
+        if (Status s = create_shortcut(link, target, plan.install_dir, plan.aumid); s)
+        {
+            record.shortcuts.push_back(link);
+        }
+        else if (warnings != nullptr)
+        {
+            warnings->push_back("shortcut " + to_utf8(link) + ": " + s.message());
+        }
+    }
+
+    if (Status s = write_arp(plan, total_bytes, record); !s)
+    {
+        return s;
+    }
+
+    if (Status s = record.save(plan.install_dir); !s)
+    {
+        return s;
+    }
+
+    if (progress)
+    {
+        progress(1.0f, L"Finishing");
+    }
+    return Status::ok();
+}
+
+Status run_uninstall(const std::wstring& install_dir)
+{
+    InstallRecord record;
+    if (Status s = record.load(install_dir); !s)
+    {
+        return s;
+    }
+
+    for (const std::wstring& shortcut : record.shortcuts)
+    {
+        delete_tree_entry(shortcut);
+    }
+
+    for (const std::wstring& relative : record.files)
+    {
+        delete_tree_entry(install_dir + L"\\" + relative);
+    }
+
+    // Deepest first, so a parent is only attempted once its children are gone.
+    std::vector<std::wstring> dirs = record.directories;
+    std::sort(dirs.begin(), dirs.end(),
+              [](const std::wstring& a, const std::wstring& b) { return a.size() > b.size(); });
+    for (const std::wstring& dir : dirs)
+    {
+        RemoveDirectoryW(long_path(install_dir + L"\\" + dir).c_str());
+    }
+
+    if (!record.arp_key.empty())
+    {
+        RegDeleteKeyExW(scope_root(record.scope), (kUninstallPath + record.arp_key).c_str(),
+                        KEY_WOW64_64KEY, 0);
+    }
+
+    // The manifest, then the meta directory, then the install directory itself.
+    // The uninstaller is running from inside the meta directory, so its own
+    // image cannot be unlinked yet; that is handled by the caller.
+    delete_tree_entry(install_dir + L"\\" + kMetaDir + L"\\" + kManifestName);
+
+    return Status::ok();
+}
+
+} // namespace lwi::stub

@@ -74,7 +74,10 @@ fail = "Close DeadLetter before installing."
 
 [[actions]]
 type  = "shortcut"
-target = "{InstallDir}\\deadletter.exe"
+# Must match the layout of the payload directory, not the product name. A
+# shortcut to a path that does not exist is created without complaint by the
+# shell and only fails when someone clicks it.
+target = "{InstallDir}\\bin\\deadletter.exe"
 where  = "common_programs"
 name   = "DeadLetter"
 

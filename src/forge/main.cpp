@@ -367,6 +367,26 @@ int cmd_build(int argc, wchar_t** argv)
         return fail("payload directory is empty");
     }
 
+    // Embed the stub as the uninstaller.
+    //
+    // It is added as an ordinary payload member so it is extracted, hashed and
+    // verified like everything else, and so the uninstaller left behind on a
+    // customer machine is the SAME signed binary rather than something the
+    // installer stamps out at runtime. An unsigned uninstaller sitting in
+    // Program Files and running elevated is exactly what SmartScreen and Smart
+    // App Control are there to complain about.
+    {
+        std::vector<uint8_t> uninstaller;
+        if (Status s = read_whole_file(args.stub, uninstaller); !s)
+        {
+            return fail("reading stub for the embedded uninstaller: " + s.message());
+        }
+        if (Status s = writer.add_file(".lw\\uninstall.exe", uninstaller); !s)
+        {
+            return fail(s);
+        }
+    }
+
     const fs::path payload_root(args.payload);
     uint64_t raw_total = 0;
     for (const fs::path& file : files)
@@ -425,7 +445,8 @@ int cmd_build(int argc, wchar_t** argv)
         {
             return fail("verification after packaging: " + s.message());
         }
-        if (check.files().size() != files.size())
+        // files.size() + 1 for the embedded uninstaller.
+        if (check.files().size() != files.size() + 1)
         {
             return fail("verification after packaging: payload count mismatch");
         }
@@ -509,6 +530,24 @@ int cmd_inspect(int argc, wchar_t** argv)
                 std::string(config.get("product.version")).c_str());
     std::printf("  publisher  %s\n", std::string(config.get("product.publisher")).c_str());
     std::printf("  config     %zu keys\n", config.entries().size());
+    for (const auto& [key, value] : config.entries())
+    {
+        // Truncated because a license body is thousands of characters and would
+        // bury everything else. The point of inspect is to see the structure.
+        std::string shown = value;
+        if (shown.size() > 60)
+        {
+            shown = shown.substr(0, 57) + "...";
+        }
+        for (char& c : shown)
+        {
+            if (c == '\n' || c == '\r')
+            {
+                c = ' ';
+            }
+        }
+        std::printf("    %-40s %s\n", key.c_str(), shown.c_str());
+    }
     std::printf("  payload    %zu files\n", reader.files().size());
 
     for (const FileView& file : reader.files())

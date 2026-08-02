@@ -3,10 +3,12 @@ cmake_minimum_required(VERSION 3.28)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(LwiVersion)
 
-project(lwi VERSION ${LWI_VERSION} LANGUAGES CXX)
+# LockeWerks Forge. Target and namespace prefixes stay lwi, which reads as
+# LockeWerks Installer and matches the lwforge / lwstub binary names.
+project(forge VERSION ${LWI_VERSION} LANGUAGES CXX)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "lwi targets Windows only.")
+    message(FATAL_ERROR "Forge targets Windows only.")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -18,7 +20,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Detection heuristics, which auto-elevate anything whose name looks like a
 # setup program, only reach 32-bit images.
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "lwi is x64 only. Configure with an x64 toolchain.")
+    message(FATAL_ERROR "Forge is x64 only. Configure with an x64 toolchain.")
 endif()
 
 option(LWI_BUILD_TESTS "Build the test suite" ON)
@@ -46,5 +48,5 @@ if(LWI_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-message(STATUS "lwi ${LWI_VERSION}  tests=${LWI_BUILD_TESTS} tools=${LWI_BUILD_TOOLS} "
+message(STATUS "Forge ${LWI_VERSION}  tests=${LWI_BUILD_TESTS} tools=${LWI_BUILD_TOOLS} "
                "stub=${LWI_BUILD_STUB} hardening=${LWI_HARDENING} werror=${LWI_WERROR}")
