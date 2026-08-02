@@ -495,6 +495,28 @@ int cmd_build(int argc, wchar_t** argv)
         {
             return fail("reading stub for the embedded uninstaller: " + s.message());
         }
+
+        // The uninstaller is whatever stub was handed in, so it is signed only
+        // if that stub was already signed. Signing the finished installer does
+        // nothing for the copy inside it: that copy is payload, hashed and
+        // extracted, not re-signed on the way out.
+        //
+        // An unsigned uninstaller sitting permanently in Program Files and
+        // invoked elevated by Settings is exactly what the embedding was meant
+        // to avoid, so a release build refuses rather than shipping one.
+        PeLayout stub_layout;
+        if (Status s = pe_parse(uninstaller, stub_layout); !s)
+        {
+            return fail("stub is not a valid PE: " + s.message());
+        }
+        if (!stub_layout.is_signed() && !args.dev)
+        {
+            return fail(
+                "the stub is unsigned, so the embedded uninstaller would be too.\n"
+                "  Sign the stub before forging, or pass --dev to accept it.\n"
+                "  The release path is two stages: build and sign lwstub.exe with the\n"
+                "  release-stage1 preset, then forge against the signed copy.");
+        }
         if (Status s = writer.add_file(".lw\\uninstall.exe", uninstaller); !s)
         {
             return fail(s);
