@@ -164,8 +164,7 @@ jobs:
     runs-on: windows-latest
     environment: release
     permissions:
-      id-token: write   # OIDC. No client secret is stored anywhere.
-      contents: read
+      contents: write   # to publish the release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -174,30 +173,37 @@ jobs:
           path: staged
 
       # Fail on missing configuration before anything expensive runs, and
-      # before a partially-configured signing step produces an unsigned
-      # artifact that looks like a successful build.
+      # before a half-configured signing step produces an unsigned artifact
+      # that looks like a successful build.
       - name: Preflight the signing configuration
         shell: pwsh
-        run: |
-          $missing = @()
-          foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID') {
-            if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue).Value) { $missing += $name }
-          }
-          if ($missing) { throw "missing repository variables: $($missing -join ', ')" }
         env:
           AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          $missing = @()
+          foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET') {
+            if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue).Value) { $missing += $name }
+          }
+          if ($missing) {
+            throw "missing signing configuration: $($missing -join ', '). See docs/signing.md."
+          }
+          $files = Get-ChildItem staged -Recurse -Include *.exe
+          if (-not $files) { throw "no artifacts were downloaded to sign" }
+          "will sign:"; $files | ForEach-Object { "  $($_.Name)" }
 
-      - uses: azure/login@v2
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
+      # Client-secret auth. The service principal cannot provision its own
+      # federated credential (it has no Graph application roles), so OIDC needs
+      # a one-time directory change that CI cannot make for itself.
+      # scripts/New-FederatedCredential.ps1 performs that upgrade, and
+      # docs/signing.md describes the two-line workflow change that follows it.
       - name: Sign
         uses: azure/trusted-signing-action@v0
         with:
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           endpoint: https://eus.codesigning.azure.net
           trusted-signing-account-name: specterpoint
           certificate-profile-name: specterpoint
@@ -206,7 +212,7 @@ jobs:
           files-folder-recurse: true
           file-digest: SHA256
           # Certificates are valid for three days, so the timestamp is what
-          # keeps the signature valid past the weekend. It is not optional.
+          # keeps the signature valid past the weekend. Not optional.
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
@@ -219,7 +225,7 @@ jobs:
           if (-not $files) { throw "nothing to verify" }
           foreach ($file in $files) {
             $sig = Get-AuthenticodeSignature -FilePath $file.FullName
-            "$($file.Name): $($sig.Status)"
+            "$($file.Name): $($sig.Status)  $($sig.SignerCertificate.Subject)"
             if ($sig.Status -ne 'Valid') { throw "$($file.Name) is $($sig.Status)" }
           }
 
@@ -228,3 +234,14 @@ jobs:
           name: lwi-signed
           path: staged
           if-no-files-found: error
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag (Get-ChildItem staged -Recurse -Include *.exe | ForEach-Object { $_.FullName }) `
+            --repo "${{ github.repository }}" `
+            --title "Forge $tag" `
+            --notes "Signed with Azure Artifact Signing, certificate profile ``specterpoint``.`n`nlwstub.exe is the installer stub. Sign it before forging so the uninstaller it leaves behind is signed too, or use scripts/package.ps1 which does both stages in order."
