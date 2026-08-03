@@ -107,12 +107,40 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# signtool exiting zero is not the same as the file being signed. DeadLetter's
-# CI learned this the expensive way and checks the same thing afterwards.
-$signature = Get-AuthenticodeSignature -FilePath $resolved
-if ($signature.Status -ne 'Valid') {
-    Write-Error "ERROR: signature status is $($signature.Status), expected Valid"
-    exit 1
+# A second, independent read of the same file. signtool exiting zero is not the
+# same as the file being signed, and DeadLetter's CI learned that expensively.
+#
+# Guarded, because this script is invoked by lwforge as a child process and
+# inherits whatever environment the caller has. A Visual Studio developer prompt
+# rewrites PSModulePath, which breaks module autoloading in the child, and
+# Get-AuthenticodeSignature then fails to resolve at all. That is not a signing
+# failure and must not be reported as one: signtool verify /pa has already run
+# above and would have exited non-zero if the file were not properly signed.
+# try/catch, not -ErrorAction. A broken PSModulePath makes the import throw a
+# FormatXmlUpdateException from the formatting engine, which error preferences
+# do not suppress, and the whole script dies reporting a signing failure that
+# did not happen.
+$signature = $null
+try {
+    Import-Module Microsoft.PowerShell.Security
+    $signature = Get-AuthenticodeSignature -FilePath $resolved
+}
+catch {
+    $signature = $null
 }
 
-Write-Host "`nSigned by: $($signature.SignerCertificate.Subject)" -ForegroundColor Green
+if ($signature) {
+    if ($signature.Status -ne 'Valid') {
+        Write-Error "ERROR: signature status is $($signature.Status), expected Valid"
+        exit 1
+    }
+    Write-Host "`nSigned by: $($signature.SignerCertificate.Subject)" -ForegroundColor Green
+}
+else {
+    Write-Host "`nSigned and verified by signtool." -ForegroundColor Green
+    Write-Host "(Get-AuthenticodeSignature is unavailable in this environment. signtool" `
+               -ForegroundColor DarkGray
+    Write-Host " verify /pa above is the authoritative check; package.ps1 re-verifies" `
+               -ForegroundColor DarkGray
+    Write-Host " independently in the parent shell.)" -ForegroundColor DarkGray
+}

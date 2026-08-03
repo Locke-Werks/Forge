@@ -34,9 +34,87 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Enter-DeveloperEnvironment {
+    # The release presets use Ninja, which needs cl.exe on PATH. Requiring the
+    # operator to remember to open an "x64 Native Tools" prompt is how a release
+    # script fails with "configure failed" and nothing else, which is exactly
+    # what happened the first time this ran.
+    if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        throw "vswhere.exe not found. Install Visual Studio 2022 with the C++ workload."
+    }
+
+    $install = & $vswhere -latest -products * `
+                          -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                          -property installationPath
+    if (-not $install) {
+        throw "no Visual Studio installation with the C++ x64 toolset was found"
+    }
+
+    $vcvars = Join-Path $install "VC\Auxiliary\Build\vcvars64.bat"
+    if (-not (Test-Path -LiteralPath $vcvars)) {
+        throw "vcvars64.bat not found at $vcvars"
+    }
+
+    # vcvars64 sets VCPKG_ROOT to the copy of vcpkg bundled inside Visual
+    # Studio, silently replacing whichever one the machine is configured to use.
+    # The presets resolve their toolchain file through $env{VCPKG_ROOT}, so
+    # importing the developer environment wholesale switches vcpkg instances
+    # halfway through a release build.
+    #
+    # It surfaces as a port failing to build rather than as anything about
+    # vcpkg: stage 1 needs no ports and succeeds, then stage 2 reports
+    # "tomlplusplus build failure" from a vcpkg nobody chose.
+    $originalVcpkgRoot = $env:VCPKG_ROOT
+
+    # Run it in cmd and import the resulting environment, since a batch file
+    # cannot change this process's environment on its own.
+    & cmd.exe /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+        if ($_ -match '^([^=]+)=(.*)$') {
+            Set-Item "env:$($Matches[1])" $Matches[2]
+        }
+    }
+
+    if ($originalVcpkgRoot) {
+        $env:VCPKG_ROOT = $originalVcpkgRoot
+    }
+
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+        throw "the developer environment did not take: cl.exe is still not on PATH"
+    }
+
+    # vcvars64 does NOT put Ninja on PATH. It ships inside the Visual Studio
+    # CMake extension, which the developer prompt never adds, so the release
+    # presets fail with "unable to find a build program corresponding to Ninja"
+    # even from a correctly set up x64 Native Tools prompt. vcpkg fails first
+    # and louder, reporting a port build failure that has nothing to do with the
+    # port.
+    #
+    # Discovered rather than pinned, for the same reason signtool is.
+    if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
+        $ninja = Get-ChildItem -LiteralPath $install -Filter ninja.exe -Recurse `
+                               -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+        if (-not $ninja) {
+            throw "ninja.exe not found under $install. Install the C++ CMake tools component."
+        }
+        $env:PATH = "$($ninja.DirectoryName);$env:PATH"
+    }
+
+    Write-Host "developer environment: $install" -ForegroundColor DarkGray
+    Write-Host "ninja:       $((Get-Command ninja.exe).Source)" -ForegroundColor DarkGray
+    Write-Host "VCPKG_ROOT:  $env:VCPKG_ROOT" -ForegroundColor DarkGray
+}
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $RepoRoot
 try {
+    Enter-DeveloperEnvironment
+
     foreach ($required in @($Config, $Payload)) {
         if (-not (Test-Path -LiteralPath $required)) {
             throw "not found: $required"
@@ -49,7 +127,7 @@ try {
                 throw "$name is not set. Set the three signing variables, or pass -SkipSigning."
             }
         }
-        & "$PSScriptRoot/New-SigningMetadata.ps1" | Out-Null
+        & "$PSScriptRoot/New-SigningMetadata.ps1" -Force | Out-Null
     }
 
     Write-Host "--- Stage 1: build the stub ---" -ForegroundColor Cyan
