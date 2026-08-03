@@ -120,6 +120,58 @@ an `.exe` extension that is not a valid PE fails the save outright. A target
 that does not exist is fine, which is why this only bites once a payload is
 present.
 
+## `[[services]]`
+
+Machine scope only. A per-user install with services declared skips them and
+says so in the warnings rather than failing.
+
+| Key | Notes |
+|---|---|
+| `name` | Service name |
+| `display_name` | Defaults to `name` |
+| `description` | Shown in services.msc |
+| `binary` | Supports tokens. Quoted automatically |
+| `args` | Array, appended to the binary path |
+| `start` | `demand` (default), `auto`, `disabled` |
+| `account` | Defaults to LocalSystem |
+| `start_now` | Start it after creating it |
+
+The binary path is quoted whether or not it contains a space. An unquoted
+service path is the unquoted service path vulnerability: Windows tries
+`C:\Program.exe` before `C:\Program Files\...`.
+
+A service that already exists is reconfigured rather than recreated, and is
+**not** recorded for deletion, because this install did not create it. Stopping
+waits for the service to actually reach STOPPED: `ControlService` returning
+success only means the stop was accepted, and deleting a running service marks
+it for deletion until every handle closes, which is how a reinstall hits
+`ERROR_SERVICE_MARKED_FOR_DELETE` for no visible reason.
+
+## `[[assoc]]`
+
+| Key | Notes |
+|---|---|
+| `progid` | The ProgID to create |
+| `extension` | e.g. `.eml`. Registered through `OpenWithProgids` |
+| `friendly` | Display name for the ProgID |
+| `icon` | `path,index` |
+| `open_command` | Supports tokens. `%1` is the file |
+| `app_name` | Enables the Capabilities registration |
+| `app_description` | **Required** for Capabilities |
+
+The extension is registered additively through `OpenWithProgids`. The
+extension's default value is deliberately not written: that would seize the
+association from whatever already owns it, and Windows overrides it on next
+launch regardless.
+
+`ApplicationDescription` is required or the application is left out of the
+Default Apps UI entirely. Registration is all an installer can do. Windows has
+blocked programmatic default-handler changes since the UserChoice hash, enforced
+by `UCPD.sys` since 2024, so nothing here tries to claim a default.
+
+`HKCR` is never written directly. Machine scope writes `HKLM\SOFTWARE\Classes`,
+per-user writes `HKCU\SOFTWARE\Classes`.
+
 ## `[[hooks.<phase>]]`
 
 Phases: `post_extract`, `pre_register`, `post_install`, `pre_uninstall`,

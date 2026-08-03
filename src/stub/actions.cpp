@@ -269,6 +269,16 @@ bool same_path(const std::wstring& a, const std::wstring& b)
 
 } // namespace
 
+std::wstring registry_existing_ancestor(bool machine, const std::wstring& subkey)
+{
+    return existing_ancestor(machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER, subkey);
+}
+
+void registry_prune_created(bool machine, const std::wstring& subkey, const std::wstring& stop_at)
+{
+    prune_created_keys(machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER, subkey, stop_at);
+}
+
 void broadcast_environment_change()
 {
     // SendMessageTimeout takes SEVEN parameters. The trailing lpdwResult is

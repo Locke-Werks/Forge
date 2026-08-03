@@ -51,10 +51,23 @@ function Get-MachineState {
     $link = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\DeadLetter.lnk"
     $linkState = if (Test-Path -LiteralPath $link) { 'present' } else { 'absent' }
 
+    # Services and associations are watched too. A state snapshot that only
+    # covers files and the ARP key cannot see a service left running or an
+    # extension left registered, which is exactly the residue rollback is for.
+    $svcState = if (Get-Service -Name LwiTestSvc -ErrorAction SilentlyContinue) {
+        'present'
+    } else {
+        'absent'
+    }
+
+    $assocState = if (Test-Path 'HKLM:\SOFTWARE\Classes\.lwitest') { 'present' } else { 'absent' }
+
     [pscustomobject]@{
-        Files = ($files -join '|')
-        Arp   = $arpState
-        Link  = $linkState
+        Files   = ($files -join '|')
+        Arp     = $arpState
+        Link    = $linkState
+        Service = $svcState
+        Assoc   = $assocState
     }
 }
 
@@ -85,6 +98,13 @@ function Remove-Everything {
     } catch {}
     $link = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\DeadLetter.lnk"
     if (Test-Path -LiteralPath $link) { [IO.File]::Delete($link) }
+
+    if (Get-Service -Name LwiTestSvc -ErrorAction SilentlyContinue) {
+        & sc.exe delete LwiTestSvc | Out-Null
+    }
+    foreach ($key in 'SOFTWARE\Classes\.lwitest', 'SOFTWARE\Classes\LockeWerks.LwiTest.1') {
+        try { [Microsoft.Win32.Registry]::LocalMachine.DeleteSubKeyTree($key) } catch {}
+    }
 }
 
 function Invoke-Install {
@@ -109,7 +129,8 @@ function Invoke-Install {
 $Installer = (Resolve-Path $Installer).Path
 Remove-Everything -Path $Target
 $baseline = Get-MachineState -Path $Target
-Write-Host "baseline: files='$($baseline.Files)' arp=$($baseline.Arp) link=$($baseline.Link)"
+Write-Host ("baseline: arp={0} link={1} svc={2} assoc={3} files='{4}'" -f `
+            $baseline.Arp, $baseline.Link, $baseline.Service, $baseline.Assoc, $baseline.Files)
 
 # Control run, before any sweeping.
 #
@@ -147,13 +168,16 @@ for ($step = 0; $step -lt $MaxSteps; $step++) {
 
     $clean = ($state.Files -eq $baseline.Files) -and
              ($state.Arp -eq $baseline.Arp) -and
-             ($state.Link -eq $baseline.Link)
+             ($state.Link -eq $baseline.Link) -and
+             ($state.Service -eq $baseline.Service) -and
+             ($state.Assoc -eq $baseline.Assoc)
 
     if ($clean) {
         Write-Host ("  step {0,2}: exit {1,-5} clean" -f $step, $code)
     } else {
-        Write-Host ("  step {0,2}: exit {1,-5} RESIDUE files='{2}' arp={3} link={4}" -f `
-                    $step, $code, $state.Files, $state.Arp, $state.Link) -ForegroundColor Red
+        Write-Host ("  step {0,2}: exit {1,-5} RESIDUE arp={2} link={3} svc={4} assoc={5} files='{6}'" -f `
+                    $step, $code, $state.Arp, $state.Link, $state.Service, $state.Assoc,
+                    $state.Files) -ForegroundColor Red
         $failures += "inject step $step"
     }
 }

@@ -12,6 +12,7 @@
 
 #include "actions.h"
 #include "journal.h"
+#include "services.h"
 #include "hooks.h"
 #include "lwi/win_file.h"
 
@@ -496,6 +497,8 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         {
             delete_tree_entry(shortcut);
         }
+        revert_associations(record);
+        revert_services(record);
         revert_actions(record);
         journal.rollback();
         return status;
@@ -699,6 +702,16 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         return abort(s);
     }
 
+    if (Status s = apply_services(config, plan, record, warnings); !s)
+    {
+        return abort(s);
+    }
+
+    if (Status s = apply_associations(config, plan, record, warnings); !s)
+    {
+        return abort(s);
+    }
+
     if (Status s = fault_check(step++); !s)
     {
         return abort(s);
@@ -792,6 +805,8 @@ Status run_uninstall(const std::wstring& install_dir)
         RemoveDirectoryW(long_path(install_dir + L"\\" + dir).c_str());
     }
 
+    revert_associations(record);
+    revert_services(record);
     revert_actions(record);
 
     if (!record.arp_key.empty())
