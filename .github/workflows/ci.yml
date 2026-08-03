@@ -126,6 +126,14 @@ jobs:
           if (Test-Path $target) { throw "install directory survived uninstall" }
           if (Test-Path $arp) { throw "ARP entry survived uninstall" }
 
+      # Rollback only runs when something has already gone wrong, on a machine
+      # nobody is watching. It cannot be left to chance, so every build sweeps
+      # a deliberate failure through each step and requires the machine to come
+      # back to exactly where it started.
+      - name: Fault injection matrix
+        shell: pwsh
+        run: ./tests/fault/Run-FaultMatrix.ps1 -Installer dist/DeadLetter-Setup.exe -MaxSteps 14
+
       - name: Tampering must be detected
         shell: pwsh
         run: |
