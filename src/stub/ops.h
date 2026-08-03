@@ -83,6 +83,26 @@ inline constexpr const char* kUninstallerPayloadPath = ".lw\\uninstall.exe";
 
 using ProgressFn = std::function<bool(float fraction, const std::wstring& status)>;
 
+/// Deliberate failure injection, for testing rollback.
+///
+/// Rollback only runs when something has already gone wrong, on a machine
+/// nobody is watching, and several of its failure modes look identical to
+/// success. It cannot be tested by hoping an install fails, so the engine
+/// exposes a way to make it fail on purpose at a numbered step.
+///
+/// LWI_FAULT_INJECT=<n> returns an error after step n, exercising the ordinary
+/// unwind. LWI_FAULT_KILL=<n> terminates the process instead, leaving an
+/// uncommitted journal so the NEXT run has to recover it. Both are inert unless
+/// the variable is set, and both are compiled in deliberately: a rollback path
+/// that only exists in a test build is a rollback path that ships untested.
+Status fault_check(uint32_t step);
+
+/// Deletes a directory and everything under it. Missing is success.
+void remove_directory_tree(const std::wstring& path);
+
+/// Creates a directory and any missing parents.
+Status ensure_directory_exists(const std::wstring& path);
+
 /// Runs an install.
 ///
 /// warnings collects anything that did not stop the install but that the

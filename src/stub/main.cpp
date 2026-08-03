@@ -211,35 +211,6 @@ void write_console(const std::string& text)
     }
 }
 
-void remove_tree(const std::wstring& path)
-{
-    WIN32_FIND_DATAW find{};
-    const HANDLE handle = FindFirstFileW(long_path(path + L"\\*").c_str(), &find);
-    if (handle != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            const std::wstring name = find.cFileName;
-            if (name == L"." || name == L"..")
-            {
-                continue;
-            }
-            const std::wstring child = path + L"\\" + name;
-            if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-            {
-                remove_tree(child);
-            }
-            else
-            {
-                SetFileAttributesW(long_path(child).c_str(), FILE_ATTRIBUTE_NORMAL);
-                DeleteFileW(long_path(child).c_str());
-            }
-        } while (FindNextFileW(handle, &find));
-        FindClose(handle);
-    }
-    RemoveDirectoryW(long_path(path).c_str());
-}
-
 /// Relaunches a copy of this executable from the temp directory so it can
 /// delete the directory this one is running from.
 ///
@@ -379,7 +350,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
                 CloseHandle(parent);
             }
         }
-        remove_tree(options.finish_dir);
+        remove_directory_tree(options.finish_dir);
 
         // Schedule this copy's own removal. Best effort: MOVEFILE_DELAY_UNTIL_
         // REBOOT needs administrator rights, so an unelevated per-user

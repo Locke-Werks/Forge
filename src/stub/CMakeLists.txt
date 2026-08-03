@@ -11,6 +11,7 @@ add_executable(lwstub WIN32
     checks.cpp
     actions.cpp
     hooks.cpp
+    journal.cpp
     theme.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/stub.rc"
 )

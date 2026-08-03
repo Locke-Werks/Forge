@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "actions.h"
+#include "journal.h"
 #include "hooks.h"
 #include "lwi/win_file.h"
 
@@ -147,6 +148,70 @@ Status delete_tree_entry(const std::wstring& path)
 }
 
 } // namespace
+
+Status fault_check(uint32_t step)
+{
+    const auto read_step = [](const wchar_t* name, uint32_t& out) {
+        wchar_t buffer[32]{};
+        const DWORD n = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
+        if (n == 0 || n >= std::size(buffer))
+        {
+            return false;
+        }
+        out = static_cast<uint32_t>(_wtoi(buffer));
+        return true;
+    };
+
+    uint32_t target = 0;
+    if (read_step(L"LWI_FAULT_KILL", target) && target == step)
+    {
+        // No unwinding, no destructors, no journal commit. This is what a power
+        // loss looks like from the filesystem's point of view.
+        TerminateProcess(GetCurrentProcess(), 1);
+    }
+
+    if (read_step(L"LWI_FAULT_INJECT", target) && target == step)
+    {
+        return Status::error(Code::IoError,
+                             "deliberate fault injected at step " + std::to_string(step));
+    }
+
+    return Status::ok();
+}
+
+void remove_directory_tree(const std::wstring& path)
+{
+    WIN32_FIND_DATAW find{};
+    const HANDLE handle = FindFirstFileW(long_path(path + L"\\*").c_str(), &find);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            const std::wstring name = find.cFileName;
+            if (name == L"." || name == L"..")
+            {
+                continue;
+            }
+            const std::wstring child = path + L"\\" + name;
+            if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                remove_directory_tree(child);
+            }
+            else
+            {
+                SetFileAttributesW(long_path(child).c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(long_path(child).c_str());
+            }
+        } while (FindNextFileW(handle, &find));
+        FindClose(handle);
+    }
+    RemoveDirectoryW(long_path(path).c_str());
+}
+
+Status ensure_directory_exists(const std::wstring& path)
+{
+    return ensure_directory(path);
+}
 
 InstallPlan plan_from_config(const Config& config, const std::wstring& install_dir_override)
 {
@@ -395,8 +460,51 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         return s;
     }
 
+    // The journal lives in the meta directory, so that has to exist before the
+    // first record is written. It used to be created later, by record.save,
+    // which meant journal.begin failed instantly on every install and the whole
+    // fault matrix passed vacuously.
+    if (Status s = ensure_directory(plan.install_dir + L"\\" + kMetaDir); !s)
+    {
+        return s;
+    }
+
+    // An earlier install that crashed leaves an uncommitted journal. Undo it
+    // before touching anything, so this install starts from a known state
+    // rather than layering onto a half-written one.
+    if (const size_t undone = Journal::recover(plan.install_dir); undone != 0 && warnings != nullptr)
+    {
+        warnings->push_back("rolled back " + std::to_string(undone) +
+                            " operations from an interrupted install");
+    }
+
+    Journal journal;
+    if (Status s = journal.begin(plan.install_dir); !s)
+    {
+        return s;
+    }
+
+    // Every failure past this point unwinds. Declared once here rather than
+    // repeated at each return, because the one path that forgets to roll back
+    // is the one that leaves a machine broken.
+    // One place that knows how to unwind everything, so no failure path can
+    // forget a category. Shortcuts were the category it forgot: files rolled
+    // back and registry values reverted while a Start Menu entry pointing at a
+    // deleted directory survived every failed install.
+    const auto abort = [&](Status status) {
+        for (const std::wstring& shortcut : record.shortcuts)
+        {
+            delete_tree_entry(shortcut);
+        }
+        revert_actions(record);
+        journal.rollback();
+        return status;
+    };
+
     const std::vector<FileView>& files = reader.files();
     uint64_t total_bytes = 0;
+    uint32_t backup_sequence = 0;
+    uint32_t step = 0;
 
     for (size_t i = 0; i < files.size(); ++i)
     {
@@ -404,42 +512,101 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         if (progress && !progress(static_cast<float>(i) / static_cast<float>(files.size()),
                                   relative))
         {
-            return Status::error(Code::InvalidArgument, "cancelled");
+            return abort(Status::error(Code::InvalidArgument, "cancelled"));
+        }
+
+        if (Status s = fault_check(step++); !s)
+        {
+            return abort(s);
         }
 
         std::vector<uint8_t> contents;
         if (Status s = reader.extract(i, contents); !s)
         {
-            return s;
+            return abort(s);
         }
 
         const std::wstring destination = plan.install_dir + L"\\" + relative;
-        const size_t slash = destination.find_last_of(L'\\');
+
+        const size_t slash = relative.find_last_of(L'\\');
         if (slash != std::wstring::npos)
         {
-            if (Status s = ensure_directory(destination.substr(0, slash)); !s)
+            const std::wstring relative_dir = relative.substr(0, slash);
+            if (GetFileAttributesW(long_path(plan.install_dir + L"\\" + relative_dir).c_str()) ==
+                INVALID_FILE_ATTRIBUTES)
             {
-                return s;
-            }
-            const size_t rel_slash = relative.find_last_of(L'\\');
-            if (rel_slash != std::wstring::npos)
-            {
-                std::wstring dir = relative.substr(0, rel_slash);
-                if (std::find(record.directories.begin(), record.directories.end(), dir) ==
-                    record.directories.end())
+                if (Status s = journal.record(JournalOp::DirCreated, relative_dir); !s)
                 {
-                    record.directories.push_back(dir);
+                    return abort(s);
                 }
+            }
+            if (Status s = ensure_directory(plan.install_dir + L"\\" + relative_dir); !s)
+            {
+                return abort(s);
+            }
+            if (std::find(record.directories.begin(), record.directories.end(), relative_dir) ==
+                record.directories.end())
+            {
+                record.directories.push_back(relative_dir);
+            }
+        }
+
+        const bool exists =
+            GetFileAttributesW(long_path(destination).c_str()) != INVALID_FILE_ATTRIBUTES;
+
+        if (exists)
+        {
+            // Rename the original aside rather than overwriting it. This is
+            // both the rollback copy and the only way to replace a file that is
+            // currently running: Windows permits renaming a mapped image, it
+            // only forbids unlinking one. MOVEFILE_REPLACE_EXISTING is
+            // deliberately NOT passed, because the destination must not exist.
+            const std::wstring backup_relative =
+                Journal::backup_path_for(relative, backup_sequence++);
+            const std::wstring backup = plan.install_dir + L"\\" + backup_relative;
+
+            const size_t backup_slash = backup.find_last_of(L'\\');
+            if (backup_slash != std::wstring::npos)
+            {
+                if (Status s = ensure_directory(backup.substr(0, backup_slash)); !s)
+                {
+                    return abort(s);
+                }
+            }
+
+            if (Status s = journal.record(JournalOp::FileReplaced, relative, backup_relative); !s)
+            {
+                return abort(s);
+            }
+
+            if (!MoveFileExW(long_path(destination).c_str(), long_path(backup).c_str(), 0))
+            {
+                return abort(Status::error(
+                    Code::IoError,
+                    win32_message("MoveFileExW (saving the original of " + to_utf8(relative) + ")",
+                                  GetLastError())));
+            }
+        }
+        else
+        {
+            if (Status s = journal.record(JournalOp::FileCreated, relative); !s)
+            {
+                return abort(s);
             }
         }
 
         if (Status s = write_whole_file(destination, contents); !s)
         {
-            return s;
+            return abort(s);
         }
 
         record.files.push_back(relative);
         total_bytes += contents.size();
+    }
+
+    if (Status s = fault_check(step++); !s)
+    {
+        return abort(s);
     }
 
     // Files are on disk. This is the first point a product's own code can run.
@@ -455,7 +622,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         }
         if (!ok)
         {
-            return Status::error(Code::IoError, "a required post_extract hook failed");
+            return abort(Status::error(Code::IoError, "a required post_extract hook failed"));
         }
     }
 
@@ -471,7 +638,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         }
         if (!ok)
         {
-            return Status::error(Code::IoError, "a required pre_register hook failed");
+            return abort(Status::error(Code::IoError, "a required pre_register hook failed"));
         }
     }
 
@@ -529,12 +696,17 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
 
     if (Status s = apply_actions(config, plan, record, warnings); !s)
     {
-        return s;
+        return abort(s);
+    }
+
+    if (Status s = fault_check(step++); !s)
+    {
+        return abort(s);
     }
 
     if (Status s = write_arp(plan, total_bytes, record); !s)
     {
-        return s;
+        return abort(s);
     }
 
     for (const auto& [key, value] : config.entries())
@@ -547,7 +719,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
 
     if (Status s = record.save(plan.install_dir); !s)
     {
-        return s;
+        return abort(s);
     }
 
     {
@@ -562,8 +734,15 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
         }
         if (!ok)
         {
-            return Status::error(Code::IoError, "a required post_install hook failed");
+            return abort(Status::error(Code::IoError, "a required post_install hook failed"));
         }
+    }
+
+    // Nothing can unwind past this point: the saved originals are gone and the
+    // install is the state of record.
+    if (Status s = journal.commit(); !s)
+    {
+        return s;
     }
 
     if (progress)
