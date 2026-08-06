@@ -193,11 +193,10 @@ jobs:
           if (-not $files) { throw "no artifacts were downloaded to sign" }
           "will sign:"; $files | ForEach-Object { "  $($_.Name)" }
 
-      # Client-secret auth. The service principal cannot provision its own
-      # federated credential (it has no Graph application roles), so OIDC needs
-      # a one-time directory change that CI cannot make for itself.
-      # scripts/New-FederatedCredential.ps1 performs that upgrade, and
-      # docs/signing.md describes the two-line workflow change that follows it.
+      # Client-secret auth, and that is the whole of it. The service principal
+      # is a user principal with a secret, not federated: there is no workload
+      # identity and no trust relationship to configure. This has signed a
+      # release; if it fails, the fault is in the three values above.
       - name: Sign
         uses: azure/trusted-signing-action@v0
         with:

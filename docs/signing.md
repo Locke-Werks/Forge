@@ -77,6 +77,9 @@ lifetime regardless of a valid timestamp.
 
 ## CI
 
+This section covers Forge's own release. For wiring Forge into a **different**
+product's workflow, see `using-forge-in-ci.md`.
+
 The `sign` job runs only on a `v*` tag, in the `release` environment.
 
 Configuration lives in repository variables and one environment secret:
@@ -85,33 +88,16 @@ Configuration lives in repository variables and one environment secret:
 |---|---|---|
 | `AZURE_TENANT_ID` | variable | Not sensitive |
 | `AZURE_CLIENT_ID` | variable | Not sensitive |
-| `AZURE_SUBSCRIPTION_ID` | variable | Used by the OIDC path |
-| `AZURE_CLIENT_SECRET` | environment secret (`release`) | Current auth method |
+| `AZURE_CLIENT_SECRET` | environment secret (`release`) | The signing credential |
+
+Those three are the whole of it. The service principal is a user principal with
+a client secret and is not federated: there is no workload identity, no OIDC
+subject, and no GitHub trust relationship to configure. Looking for one when
+signing fails has already cost a day against a setup that was never broken.
 
 Every artifact is re-verified with `Get-AuthenticodeSignature` afterwards. The
 signing step exiting zero is not the same as the file being signed, and that is
 the check which catches a silently skipped folder.
-
-### Why a secret and not OIDC
-
-OIDC is better: no long-lived credential in GitHub. It is not wired up yet
-because the signing service principal cannot provision its own federated
-credential. It holds no Graph application roles, so reading its own app
-registration returns:
-
-```
-Authorization_RequestDenied: Insufficient privileges to complete the operation.
-```
-
-That is a one-time directory change only an administrator can make.
-`scripts/New-FederatedCredential.ps1` does it interactively and prints the
-two-line workflow edit that follows.
-
-The subject must use the environment form that matches the job
-(`repo:OWNER/NAME:environment:release`). A credential whose subject is a
-**branch** will not match a tag push, and the failure arrives at sign time as a
-403 rather than at login, which reads like a certificate-profile permissions
-problem instead of a mismatched subject.
 
 ## Releasing
 
@@ -127,7 +113,7 @@ attaches them to a GitHub release.
 
 | Symptom | Cause |
 |---|---|
-| 403 at sign time, fine at login | Missing **Artifact Signing Certificate Profile Signer** role at `certificateProfiles/<profile>` scope, or a federated credential whose subject does not match |
+| 403 at sign time, fine at login | Missing **Artifact Signing Certificate Profile Signer** role at `certificateProfiles/<profile>` scope. Granting it at account scope is not enough |
 | `0x80080057` | The file is 4 GB or larger. `lwforge` refuses earlier with a clearer message |
 | `tomlplusplus` fails to build in stage 2 only | `vcvars64` overwrote `VCPKG_ROOT` with the vcpkg bundled in Visual Studio. `package.ps1` restores it |
 | `Get-AuthenticodeSignature` not found inside `sign.ps1` | A developer prompt rewrote `PSModulePath` and the child shell cannot autoload modules. `sign.ps1` falls back to `signtool verify` |

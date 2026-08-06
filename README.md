@@ -76,6 +76,10 @@ The script probes both the current and the pre-rename install locations, and
 discovers signtool by scanning the Windows Kits directory rather than pinning an
 SDK version.
 
+That is the local path. To produce a signed installer from another product's
+GitHub Actions workflow, see `docs/using-forge-in-ci.md`, which has the whole
+recipe and a list of the things people wrongly conclude are blocking it.
+
 ## License
 
 MIT. Deliberately permissive: the stub ships inside installers for products
