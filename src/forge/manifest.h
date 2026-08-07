@@ -77,15 +77,16 @@ inline const std::string kManifestSuffix =
 
 } // namespace detail
 
-/// The default. The wizard runs unelevated so the user sees the license and any
-/// warnings before a UAC prompt, and so per-user work can happen in the
-/// invoking user's token. The stub elevates a child process when the chosen
-/// scope needs it.
+/// install.elevation = "on-demand". The wizard runs unelevated so the user sees
+/// the license and any warnings before a UAC prompt, and so per-user work can
+/// happen in the invoking user's token. The stub does not elevate itself, so a
+/// machine-scope install picking this has to be launched elevated already.
 inline const std::string kManifestAsInvoker =
     detail::kManifestPrefix + "asInvoker" + detail::kManifestSuffix;
 
-/// For products that are machine-scope only and have nothing useful to do
-/// unelevated. Costs a UAC prompt before any UI appears.
+/// The default, and install.elevation = "required". Costs a UAC prompt before
+/// any UI appears, and buys an install that can write Program Files and HKLM
+/// without the author wiring up elevation themselves.
 inline const std::string kManifestRequireAdministrator =
     detail::kManifestPrefix + "requireAdministrator" + detail::kManifestSuffix;
 

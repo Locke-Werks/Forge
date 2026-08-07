@@ -63,7 +63,7 @@ inherited from whoever launched the process.
 |---|---|---|
 | `scope` | `machine`, `user` | Decides HKLM vs HKCU and which known folders are used |
 | `dir` | path | Supports tokens. `/D=` overrides it |
-| `elevation` | `on-demand`, `required` | `on-demand` stamps an `asInvoker` manifest so the license is seen before any UAC prompt, and per-user work happens in the invoking user's token. `required` stamps `requireAdministrator` |
+| `elevation` | `on-demand`, `required` | Defaults to `required`, which stamps a `requireAdministrator` manifest: the installer asks for UAC before any UI appears. `on-demand` stamps `asInvoker` instead, so the license is seen before any prompt and per-user work happens in the invoking user's token, but the stub does not elevate itself, so a machine-scope install choosing it must be launched elevated. Any other value fails the build |
 
 ## `[ui]`
 

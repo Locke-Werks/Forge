@@ -21,8 +21,11 @@ aumid        = "LockeWerks.DeadLetter"
 [install]
 scope     = "machine"
 dir       = "{ProgramFiles}\\DeadLetter"
-# on-demand: the wizard runs unelevated so the license and warnings are visible
-# before any UAC prompt, and per-user work happens in the invoking user's token.
+# Overrides the default of required. on-demand keeps the wizard unelevated so
+# the license and warnings are visible before any UAC prompt, and so per-user
+# work happens in the invoking user's token. The trade is that nothing elevates
+# later, so a machine-scope install like this one has to be started from an
+# elevated context. Drop this line to get a UAC prompt up front instead.
 elevation = "on-demand"
 
 [ui]

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <toml++/toml.hpp>
@@ -426,13 +427,23 @@ int cmd_build(int argc, wchar_t** argv)
     }
 
     // Elevation is a config decision, so the manifest is chosen here rather
-    // than baked into the stub at link time. asInvoker plus programmatic
-    // elevation is the default: elevating before the user has seen the license
-    // is bad manners, and an elevated parent cannot reach the invoking user's
-    // HKCU or profile, which per-user actions need.
-    const bool require_admin = config.get("install.elevation") == "required";
-    const std::string manifest =
-        require_admin ? forge::kManifestRequireAdministrator : forge::kManifestAsInvoker;
+    // than baked into the stub at link time. requireAdministrator is the
+    // default because the stub does not elevate itself: a machine-scope install
+    // that starts unelevated dies at the first write to Program Files or HKLM,
+    // and machine scope is the common case. on-demand opts out and buys a
+    // license page before the UAC prompt plus a token that can still reach the
+    // invoking user's HKCU and profile, which per-user actions need.
+    //
+    // A value that is neither fails the build. Silently falling back would now
+    // hand an installer more privilege than its author asked for.
+    const std::string_view elevation = config.get("install.elevation", "required");
+    if (elevation != "required" && elevation != "on-demand")
+    {
+        return fail("install.elevation must be \"required\" or \"on-demand\", not \"" +
+                    std::string(elevation) + "\"");
+    }
+    const std::string manifest = elevation == "on-demand" ? forge::kManifestAsInvoker
+                                                          : forge::kManifestRequireAdministrator;
 
     if (Status s = forge::stamp_resources(args.out, vi, icon, manifest); !s)
     {

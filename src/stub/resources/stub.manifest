@@ -2,11 +2,13 @@
 <!--
   The baseline manifest linked into lwstub.exe.
 
-  lwforge replaces RT_MANIFEST when it stamps a product, choosing asInvoker or
-  requireAdministrator from install.elevation. This copy is what the stub itself
-  runs with during development, and it is deliberately identical to the
-  asInvoker variant in src/forge/manifest.h so a developer running the raw stub
-  sees the same behaviour a stamped installer gets.
+  lwforge replaces RT_MANIFEST when it stamps a product, choosing
+  requireAdministrator (the default) or asInvoker from install.elevation. This
+  copy is what the stub itself runs with during development, and it is
+  deliberately the asInvoker variant from src/forge/manifest.h: a raw stub
+  carries no container and installs nothing, so making every developer run of it
+  raise a UAC prompt buys nothing. Test elevation behaviour on a forged
+  installer, not on this.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
