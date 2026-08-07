@@ -258,6 +258,72 @@ TEST_CASE("container round-trips through a whole image")
     CHECK(out == file_b);
 }
 
+TEST_CASE("a zero-byte payload member round-trips")
+{
+    // Regression for #1. Compress() rejects a zero-length input, so one empty
+    // file used to fail the whole build with a message that named compression
+    // rather than the file responsible. npm trees carry these by the dozen, so
+    // it is the common case dressed as an edge case. Every algorithm is
+    // covered because the short-circuit sits on the compressed path and None
+    // would pass either way.
+    for (const CompressAlgo algo :
+         {CompressAlgo::None, CompressAlgo::Lzms, CompressAlgo::XpressHuff})
+    {
+        INFO("algorithm = " << algo_name(algo));
+
+        std::vector<uint8_t> img = make_pe();
+
+        PeLayout layout;
+        REQUIRE(pe_parse(img, layout).is_ok());
+
+        ContainerWriter writer(algo);
+        writer.set_config(bytes_of("cfg"));
+        REQUIRE(writer.add_file("bin/app.exe", bytes_of("not empty")).is_ok());
+        REQUIRE(writer.add_file("mcp/node_modules/hono/dist/types.d.ts", {}).is_ok());
+
+        std::vector<uint8_t> blob;
+        REQUIRE(writer.build(layout.payload_end, blob).is_ok());
+        img.insert(img.end(), blob.begin(), blob.end());
+
+        ContainerReader reader;
+        REQUIRE(reader.open(img).is_ok());
+        REQUIRE(reader.files().size() == 2);
+        CHECK(reader.files()[1].raw_size == 0);
+
+        std::vector<uint8_t> out;
+        REQUIRE(reader.extract(0, out).is_ok());
+        CHECK(out == bytes_of("not empty"));
+
+        // out arrives holding the previous member, so this also pins that
+        // extract replaces the buffer rather than leaving a short read behind.
+        REQUIRE(reader.extract(1, out).is_ok());
+        CHECK(out.empty());
+    }
+}
+
+TEST_CASE("a container with no files and no config round-trips")
+{
+    // The same zero-length path, reached through the config, strings and index
+    // regions instead of through a member. Those have no per-region stored
+    // flag, so they decompress with the header algorithm and would hit
+    // Decompress with nothing to do.
+    std::vector<uint8_t> img = make_pe();
+
+    PeLayout layout;
+    REQUIRE(pe_parse(img, layout).is_ok());
+
+    ContainerWriter writer(CompressAlgo::Lzms);
+
+    std::vector<uint8_t> blob;
+    REQUIRE(writer.build(layout.payload_end, blob).is_ok());
+    img.insert(img.end(), blob.begin(), blob.end());
+
+    ContainerReader reader;
+    REQUIRE(reader.open(img).is_ok());
+    CHECK(reader.files().empty());
+    CHECK(reader.config().empty());
+}
+
 TEST_CASE("container is still locatable after the image is signed")
 {
     std::vector<uint8_t> img = make_pe();

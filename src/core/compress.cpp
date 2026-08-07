@@ -96,6 +96,18 @@ Status compress_buffer(CompressAlgo algo, std::span<const uint8_t> input,
         return Status::error(Code::Unsupported, "unknown compression algorithm");
     }
 
+    // Compress() rejects a zero-length input with ERROR_INVALID_PARAMETER, and
+    // members are compressed one at a time, so a single empty file would fail
+    // the whole container with a message pointing at compression rather than at
+    // the file. Empty files are routine: type-only stubs across node_modules,
+    // placeholder markers, touch-created lockfiles. Store one as zero bytes.
+    // decompress_buffer recognises the zero raw size on the way back.
+    if (input.empty())
+    {
+        output.clear();
+        return Status::ok();
+    }
+
     Compressor c;
     if (!c.create(win_algo))
     {
@@ -151,6 +163,21 @@ Status decompress_buffer(CompressAlgo algo, std::span<const uint8_t> input,
     if (!to_win_algo(algo, win_algo))
     {
         return Status::error(Code::Unsupported, "unknown compression algorithm");
+    }
+
+    // The mirror of the empty-input case in compress_buffer. Strict about the
+    // stored side: nothing this library writes produces bytes for an entry
+    // whose raw size is zero, so data here means the index and the data
+    // disagree, which is the same condition the None path rejects above.
+    if (expected_raw_size == 0)
+    {
+        if (!input.empty())
+        {
+            return Status::error(Code::MalformedContainer,
+                                 "entry records a zero raw size but carries compressed data");
+        }
+        output.clear();
+        return Status::ok();
     }
 
     Decompressor d;
