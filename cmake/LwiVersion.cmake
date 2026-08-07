@@ -1,8 +1,8 @@
 # Single source of truth for the version. Everything else derives from it:
 # project(), the VERSIONINFO resource, and the container's META record.
 set(LWI_VERSION_MAJOR 0)
-set(LWI_VERSION_MINOR 1)
-set(LWI_VERSION_PATCH 1)
+set(LWI_VERSION_MINOR 2)
+set(LWI_VERSION_PATCH 0)
 
 set(LWI_VERSION "${LWI_VERSION_MAJOR}.${LWI_VERSION_MINOR}.${LWI_VERSION_PATCH}")
 set(LWI_VERSION_RC "${LWI_VERSION_MAJOR},${LWI_VERSION_MINOR},${LWI_VERSION_PATCH},0")

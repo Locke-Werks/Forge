@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "lwi",
-  "version-string": "0.1.1",
+  "version-string": "0.2.0",
   "description": "Locke Werks universal Windows installer",
   "$comment": [
     "tomlplusplus is used by lwforge only. The installer stub never parses text:",
