@@ -88,7 +88,7 @@ Do not choose this to avoid a token.
 
 ### Which version has what
 
-`[[options]]`, `when`, and `as = "user"` on a hook are **newer than v0.2.0**.
+`[[options]]`, `when`, and `as = "user"` on a hook need **v0.3.0 or later**.
 Pinning v0.2.0 or earlier does not fail the build and does not warn. `lwforge`
 flattens the keys into the container like any others and skips the validation
 that would reject them; the stub then never reads them. The result is not the
@@ -125,7 +125,7 @@ on:
 env:
   # Pin it. One place to bump, and a Forge release cannot silently change what
   # this job produces. See the version note under "Getting lwforge and lwstub".
-  FORGE_VERSION: v0.2.0
+  FORGE_VERSION: v0.3.0
 
 jobs:
   release:
