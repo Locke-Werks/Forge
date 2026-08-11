@@ -27,17 +27,30 @@ enum class Phase
 
 const char* phase_key(Phase phase);
 
+/// Which account a hook runs as.
+///
+/// Installer is the installer's own token, whatever that is: an elevated
+/// administrator, or SYSTEM under a deployment tool. User is the person at the
+/// keyboard, at medium integrity, with their own profile.
+enum class HookContext
+{
+    Installer,
+    User,
+};
+
 struct HookOutcome
 {
     std::string id;
     bool ran = false;
     bool ok = false;
     bool vital = false;
+    HookContext context = HookContext::Installer;
+    std::string account; // who it ran as, for the log line
     uint32_t exit_code = 0;
     std::string detail;
 };
 
-/// Runs every hook declared for a phase.
+/// Runs every hook declared for a phase, in declaration order.
 ///
 /// The security model in one paragraph: a hook may only execute a file that is
 /// a member of the payload, whose SHA-256 matches a digest written in the
@@ -46,6 +59,14 @@ struct HookOutcome
 /// binary it names invalidates the installer's signature. That is the entire
 /// reason hooks are allowed at all, and why there is no interpreter: the
 /// signature is what vouches for the code, so the code has to be signed with it.
+///
+/// `as = "user"` changes who runs it, not what may be run. The digest is checked
+/// by the elevated process before the token is dropped, so lowering privilege
+/// never lowers the bar the binary had to clear.
+///
+/// A hook whose `when` is not satisfied is skipped without an outcome. It was
+/// not declined, it was not selected, and reporting every unselected option as a
+/// non-event buries the outcomes that mean something.
 ///
 /// Returns false when a hook marked vital failed.
 bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,

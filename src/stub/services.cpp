@@ -146,6 +146,10 @@ Status apply_services(const Config& config, const InstallPlan& plan, InstallReco
     for (size_t i = 0; i < count; ++i)
     {
         const std::string prefix = "services." + std::to_string(i) + ".";
+        if (!when_satisfied(config, prefix, plan))
+        {
+            continue;
+        }
         const std::wstring name = to_wide(config.get(prefix + "name"));
         const std::wstring binary = expand_tokens(to_wide(config.get(prefix + "binary")), plan);
         if (name.empty() || binary.empty())
@@ -290,6 +294,10 @@ Status apply_associations(const Config& config, const InstallPlan& plan, Install
     for (size_t i = 0; i < count; ++i)
     {
         const std::string prefix = "assoc." + std::to_string(i) + ".";
+        if (!when_satisfied(config, prefix, plan))
+        {
+            continue;
+        }
         const std::wstring progid = to_wide(config.get(prefix + "progid"));
         const std::wstring command =
             expand_tokens(to_wide(config.get(prefix + "open_command")), plan);

@@ -13,6 +13,7 @@
 #include "lwi/config.h"
 #include "lwi/container.h"
 #include "lwi/hash.h"
+#include "lwi/options.h"
 #include "lwi/pe_layout.h"
 #include "lwi/win_file.h"
 #include "manifest.h"
@@ -149,6 +150,178 @@ int reject_control_characters(const Config& config)
     return 0;
 }
 
+static const char* const kHookPhases[] = {"hooks.post_extract", "hooks.pre_register",
+                                          "hooks.post_install", "hooks.pre_uninstall",
+                                          "hooks.post_uninstall"};
+
+/// Checks the option surface and everything gated on it.
+///
+/// Every failure here is one that is otherwise invisible until the installer is
+/// on someone else's machine. A `when` naming an option that was renamed simply
+/// never fires, and a mistyped `as` silently runs a hook elevated, which is the
+/// exact outcome `as` exists to avoid. Both are silent at runtime by design,
+/// because doing less is the safe reading of a condition nobody can evaluate.
+/// That only works if the build refuses to produce them.
+int validate_options(const Config& config)
+{
+    std::vector<std::string> ids;
+
+    const size_t count = config.array_size("options");
+    for (size_t i = 0; i < count; ++i)
+    {
+        const std::string prefix = "options." + std::to_string(i) + ".";
+        const std::string id = std::string(config.get(prefix + "id"));
+        if (id.empty())
+        {
+            return fail(prefix + "id is required");
+        }
+
+        for (const char c : id)
+        {
+            const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                 (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!allowed)
+            {
+                return fail(prefix + "id must be letters, digits, underscore or hyphen: \"" + id +
+                            "\"\n  it is typed on a command line as /O:" + id +
+                            "=off and stored as a key in the install manifest, so a dot, a space"
+                            "\n  or a comma would make one of those ambiguous");
+            }
+        }
+
+        if (std::find(ids.begin(), ids.end(), id) != ids.end())
+        {
+            return fail("two options share the id \"" + id +
+                        "\"; /O:" + id + "= would be ambiguous");
+        }
+        ids.push_back(id);
+
+        if (config.get(prefix + "label").empty())
+        {
+            return fail(prefix + "label is required; it is the sentence the person installing reads");
+        }
+    }
+
+    const auto check_when = [&](const std::string& prefix) -> int {
+        const std::string_view expression = config.get(prefix + "when");
+        if (expression.empty())
+        {
+            return 0;
+        }
+        for (const WhenTerm& term : when_terms(expression))
+        {
+            if (term.id.empty())
+            {
+                return fail(prefix + "when has an empty term: \"" + std::string(expression) + "\"");
+            }
+            if (std::find(ids.begin(), ids.end(), term.id) == ids.end())
+            {
+                std::string message = prefix + "when names \"" + std::string(term.id) +
+                                      "\", which is not a declared option";
+                if (ids.empty())
+                {
+                    message += "\n  this config declares no [[options]] at all";
+                }
+                else
+                {
+                    message += "\n  declared:";
+                    for (const std::string& id : ids)
+                    {
+                        message += " " + id;
+                    }
+                }
+                return fail(message);
+            }
+        }
+        return 0;
+    };
+
+    for (const char* array : {"actions", "services", "assoc"})
+    {
+        const size_t n = config.array_size(array);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const std::string prefix = std::string(array) + "." + std::to_string(i) + ".";
+            if (const int rc = check_when(prefix); rc != 0)
+            {
+                return rc;
+            }
+        }
+    }
+
+    // A preflight decides whether the machine qualifies, which is not a thing
+    // the user gets a checkbox for. Accepting the key and ignoring it would read
+    // as a requirement that had been made conditional.
+    const size_t preflight_count = config.array_size("preflight");
+    for (size_t i = 0; i < preflight_count; ++i)
+    {
+        const std::string prefix = "preflight." + std::to_string(i) + ".";
+        if (!config.get(prefix + "when").empty())
+        {
+            return fail(prefix +
+                        "when is not supported: a preflight check decides whether the machine"
+                        "\n  qualifies, and that cannot be optional");
+        }
+    }
+
+    for (const char* phase : kHookPhases)
+    {
+        const size_t n = config.array_size(phase);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const std::string prefix = std::string(phase) + "." + std::to_string(i) + ".";
+            if (const int rc = check_when(prefix); rc != 0)
+            {
+                return rc;
+            }
+
+            const std::string_view as = config.get(prefix + "as", "installer");
+            if (as != "installer" && as != "user")
+            {
+                return fail(prefix + "as must be \"installer\" or \"user\", not \"" +
+                            std::string(as) + "\"");
+            }
+        }
+    }
+
+    // Not fatal. An option nothing references is usually a rename that only got
+    // done on one side, but it is also a legitimate way to carry an answer into
+    // the install manifest for a hook to read later.
+    for (const std::string& id : ids)
+    {
+        bool referenced = false;
+        const auto scan = [&](const std::string& array_prefix) {
+            const size_t n = config.array_size(array_prefix);
+            for (size_t i = 0; i < n && !referenced; ++i)
+            {
+                const std::string prefix = array_prefix + "." + std::to_string(i) + ".";
+                for (const WhenTerm& term : when_terms(config.get(prefix + "when")))
+                {
+                    if (term.id == id)
+                    {
+                        referenced = true;
+                        break;
+                    }
+                }
+            }
+        };
+        for (const char* array : {"actions", "services", "assoc"})
+        {
+            scan(array);
+        }
+        for (const char* phase : kHookPhases)
+        {
+            scan(phase);
+        }
+        if (!referenced)
+        {
+            std::printf("  note      option \"%s\" is not named by any when\n", id.c_str());
+        }
+    }
+
+    return 0;
+}
+
 /// Fills in or verifies the sha256 of every hook against the payload.
 ///
 /// `sha256 = "auto"` is substituted with the real digest. An explicit digest is
@@ -157,11 +330,7 @@ int reject_control_characters(const Config& config)
 /// stub refuses to run the hook on a machine where nobody can see why.
 int resolve_hook_digests(Config& config, const std::map<std::string, Sha256>& digests)
 {
-    static const char* kPhases[] = {"hooks.post_extract", "hooks.pre_register",
-                                    "hooks.post_install", "hooks.pre_uninstall",
-                                    "hooks.post_uninstall"};
-
-    for (const char* phase : kPhases)
+    for (const char* phase : kHookPhases)
     {
         const size_t count = config.array_size(phase);
         for (size_t i = 0; i < count; ++i)
@@ -367,6 +536,11 @@ int cmd_build(int argc, wchar_t** argv)
     }
 
     if (const int rc = reject_control_characters(config); rc != 0)
+    {
+        return rc;
+    }
+
+    if (const int rc = validate_options(config); rc != 0)
     {
         return rc;
     }

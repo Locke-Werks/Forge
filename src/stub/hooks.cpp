@@ -2,10 +2,13 @@
 
 #include <windows.h>
 
+#include <shlobj.h>
+
 #include <algorithm>
 
 #include "lwi/hash.h"
 #include "lwi/win_file.h"
+#include "usercontext.h"
 
 namespace lwi::stub
 {
@@ -67,78 +70,6 @@ bool resolve_hook_target(const std::string& spec, const std::wstring& install_di
     return true;
 }
 
-/// Runs a process and waits, killing it and everything it spawned on timeout.
-///
-/// The job object is what makes the timeout mean anything: without it, killing
-/// the child leaves its children running and the installer proceeds while work
-/// it believes finished is still in flight.
-bool run_process(const std::wstring& exe, const std::wstring& command_line,
-                 const std::wstring& working_dir, DWORD timeout_ms, DWORD& exit_code,
-                 std::string& detail)
-{
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    if (job != nullptr)
-    {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-    }
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-
-    std::wstring mutable_command = command_line;
-
-    // lpApplicationName is set explicitly so the executable is never resolved
-    // through the search path, and bInheritHandles is FALSE so the child cannot
-    // reach anything the installer has open.
-    const BOOL created =
-        CreateProcessW(exe.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
-                       working_dir.empty() ? nullptr : working_dir.c_str(), &si, &pi);
-    if (!created)
-    {
-        detail = win32_message("CreateProcessW", GetLastError());
-        if (job != nullptr)
-        {
-            CloseHandle(job);
-        }
-        return false;
-    }
-
-    if (job != nullptr)
-    {
-        AssignProcessToJobObject(job, pi.hProcess);
-    }
-    ResumeThread(pi.hThread);
-
-    const DWORD wait = WaitForSingleObject(pi.hProcess, timeout_ms);
-    bool ok = false;
-
-    if (wait == WAIT_TIMEOUT)
-    {
-        TerminateProcess(pi.hProcess, 1);
-        detail = "timed out after " + std::to_string(timeout_ms) + " ms";
-        exit_code = WAIT_TIMEOUT;
-    }
-    else
-    {
-        GetExitCodeProcess(pi.hProcess, &exit_code);
-        ok = true;
-    }
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    if (job != nullptr)
-    {
-        CloseHandle(job);
-    }
-    return ok;
-}
-
 std::wstring quote_argument(const std::wstring& value)
 {
     if (value.find_first_of(L" \t\"") == std::wstring::npos)
@@ -173,7 +104,40 @@ std::wstring quote_argument(const std::wstring& value)
     return out;
 }
 
-std::wstring expand(const std::wstring& text, const InstallPlan& plan)
+/// The values the {Token} placeholders in a hook's arguments stand for.
+///
+/// Resolved per context, not once per install. The User* folders always name the
+/// account the hook itself runs as, so the same argument text means the
+/// administrator's profile in an installer-context hook and the person at the
+/// keyboard's in a user-context one. That is the honest reading, and it is why
+/// writing per-user state needs `as = "user"` rather than a clever path.
+struct Expansion
+{
+    std::wstring install_dir;
+    std::wstring version;
+    std::wstring product;
+    std::wstring user_profile;
+    std::wstring user_local_appdata;
+    std::wstring user_appdata;
+    std::wstring user_desktop;
+    std::wstring user_programs;
+};
+
+Expansion make_expansion(const InstallPlan& plan, HANDLE token)
+{
+    Expansion out;
+    out.install_dir = plan.install_dir;
+    out.version = plan.version;
+    out.product = plan.product;
+    out.user_profile = known_folder_for(FOLDERID_Profile, token);
+    out.user_local_appdata = known_folder_for(FOLDERID_LocalAppData, token);
+    out.user_appdata = known_folder_for(FOLDERID_RoamingAppData, token);
+    out.user_desktop = known_folder_for(FOLDERID_Desktop, token);
+    out.user_programs = known_folder_for(FOLDERID_Programs, token);
+    return out;
+}
+
+std::wstring expand(const std::wstring& text, const Expansion& values)
 {
     struct Token
     {
@@ -181,9 +145,14 @@ std::wstring expand(const std::wstring& text, const InstallPlan& plan)
         const std::wstring* value;
     };
     const Token tokens[] = {
-        {L"{InstallDir}", &plan.install_dir},
-        {L"{Version}", &plan.version},
-        {L"{Product}", &plan.product},
+        {L"{InstallDir}", &values.install_dir},
+        {L"{Version}", &values.version},
+        {L"{Product}", &values.product},
+        {L"{UserProfile}", &values.user_profile},
+        {L"{UserLocalAppData}", &values.user_local_appdata},
+        {L"{UserAppData}", &values.user_appdata},
+        {L"{UserDesktop}", &values.user_desktop},
+        {L"{UserPrograms}", &values.user_programs},
     };
 
     std::wstring out = text;
@@ -225,13 +194,74 @@ bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,
     const std::string base = phase_key(phase);
     const size_t count = config.array_size(base);
 
+    // Both are built on first use. An installer with no per-user hooks never
+    // reaches for another token, and one with no hooks at all resolves no known
+    // folders.
+    Expansion installer_values;
+    bool installer_values_built = false;
+
+    UserContext user;
+    Status user_status = Status::ok();
+    bool user_attempted = false;
+    Expansion user_values;
+    bool user_values_built = false;
+
     for (size_t i = 0; i < count; ++i)
     {
         const std::string prefix = base + "." + std::to_string(i) + ".";
 
+        if (!when_satisfied(config, prefix, plan))
+        {
+            continue;
+        }
+
         HookOutcome outcome;
         outcome.id = std::string(config.get(prefix + "id", prefix));
         outcome.vital = config.get_bool(prefix + "vital", false);
+        outcome.context =
+            config.get(prefix + "as") == "user" ? HookContext::User : HookContext::Installer;
+
+        // Resolving the context first, because a per-user hook on a machine with
+        // nobody logged in cannot run at all and there is no point hashing a
+        // binary for it.
+        HANDLE token = nullptr;
+        if (outcome.context == HookContext::User)
+        {
+            if (!user_attempted)
+            {
+                user_attempted = true;
+                user_status = UserContext::acquire(user);
+            }
+            if (!user_status)
+            {
+                // The usual cause is a deployment tool installing at the login
+                // screen. Real state, not a broken config: the product is
+                // installed, and the per-user part of it has not happened yet.
+                outcome.detail = user_status.message();
+                outcomes.push_back(outcome);
+                if (outcome.vital)
+                {
+                    return false;
+                }
+                continue;
+            }
+            token = user.token();
+            outcome.account = to_utf8(user.account());
+
+            if (!user_values_built)
+            {
+                user_values = make_expansion(plan, token);
+                user_values_built = true;
+            }
+        }
+        else if (!installer_values_built)
+        {
+            installer_values = make_expansion(plan, nullptr);
+            installer_values_built = true;
+        }
+
+        const Expansion& values =
+            outcome.context == HookContext::User ? user_values : installer_values;
 
         const std::string spec = std::string(config.get(prefix + "run"));
         std::wstring exe;
@@ -250,6 +280,10 @@ bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,
         // The digest is not optional. Without it the config could point at any
         // payload member and the signature would still cover the config, so the
         // pinning is what ties a hook to one specific set of bytes.
+        //
+        // Checked here, by the elevated process, before any token is dropped. A
+        // per-user hook clears exactly the same bar as an installer-context one;
+        // all that changes is who ends up owning what it writes.
         Sha256 expected{};
         const std::string digest_text = std::string(config.get(prefix + "sha256"));
         if (!from_hex(digest_text, expected))
@@ -292,18 +326,18 @@ bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,
         for (size_t a = 0; a < arg_count; ++a)
         {
             const std::wstring argument =
-                expand(to_wide(config.get(prefix + "args." + std::to_string(a))), plan);
+                expand(to_wide(config.get(prefix + "args." + std::to_string(a))), values);
             command += L" " + quote_argument(argument);
         }
 
         const DWORD timeout =
             static_cast<DWORD>(config.get_int(prefix + "timeout_ms", kDefaultTimeoutMs));
 
-        DWORD exit_code = 0;
-        std::string detail;
-        outcome.ran = run_process(exe, command, plan.install_dir, timeout, exit_code, detail);
-        outcome.exit_code = exit_code;
-        outcome.detail = detail;
+        const ProcessResult process =
+            run_process_as(token, exe, command, plan.install_dir, timeout);
+        outcome.ran = process.ran;
+        outcome.exit_code = process.exit_code;
+        outcome.detail = process.detail;
 
         if (outcome.ran)
         {
@@ -322,10 +356,10 @@ bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,
             }
 
             outcome.ok = std::find(accepted.begin(), accepted.end(),
-                                   static_cast<int64_t>(exit_code)) != accepted.end();
+                                   static_cast<int64_t>(outcome.exit_code)) != accepted.end();
             if (!outcome.ok)
             {
-                outcome.detail = "exited with " + std::to_string(exit_code);
+                outcome.detail = "exited with " + std::to_string(outcome.exit_code);
             }
         }
 

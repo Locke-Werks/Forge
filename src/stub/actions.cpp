@@ -301,6 +301,10 @@ Status apply_actions(const Config& config, const InstallPlan& plan, InstallRecor
     for (size_t i = 0; i < count; ++i)
     {
         const std::string prefix = "actions." + std::to_string(i) + ".";
+        if (!when_satisfied(config, prefix, plan))
+        {
+            continue;
+        }
         const std::string type = std::string(config.get(prefix + "type"));
 
         if (type == "registry_write")

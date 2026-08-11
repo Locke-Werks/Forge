@@ -74,6 +74,10 @@ fine-grained PAT or GitHub App installation token with `Contents: read` on
 `Locke-Werks/Forge` and store it in the consuming repo as `FORGE_TOKEN`. You get
 `lwstub.exe` already signed, which removes an entire signing pass.
 
+Pin the tag rather than tracking latest, so a Forge release cannot change what a
+product's release job produces without anyone choosing it. The workflow below
+puts the tag in one `env` value for that reason.
+
 **Alternative: vendor the two binaries.** Commit the signed `lwforge.exe` and
 `lwstub.exe` into the consuming repo under `tools/`. No token, no network. The
 cost is binaries in git and a manual bump when Forge releases.
@@ -81,6 +85,30 @@ cost is binaries in git and a manual bump when Forge releases.
 **Last resort: build Forge from source.** This produces an **unsigned** stub, so
 you must add a signing pass on the stub before forging. See the last section.
 Do not choose this to avoid a token.
+
+### Which version has what
+
+`[[options]]`, `when`, and `as = "user"` on a hook are **newer than v0.2.0**.
+Pinning v0.2.0 or earlier does not fail the build and does not warn. `lwforge`
+flattens the keys into the container like any others and skips the validation
+that would reject them; the stub then never reads them. The result is not the
+feature switched off, it is the feature inverted:
+
+| Key | What a pre-options build does |
+|---|---|
+| `when` | Ignored, so the action, service, assoc or hook runs **unconditionally** |
+| `/O:<id>=off` | Ignored rather than rejected, including ids that do not exist |
+| `as = "user"` | Ignored, so the hook runs **elevated**, in the wrong profile |
+
+Each of those is the exact outcome the key was added to prevent, arriving by way
+of the version pin. A ticked-by-default option is the least of it: an unticked
+one still fires, and per-user work still lands in the administrator's profile
+owned by `BUILTIN\Administrators`.
+
+If the product's config uses any of them, pin the Forge release that contains
+them and confirm with `--check-only`, which lists the option set a given
+installer actually declares and prints no `options` block at all on a build that
+has no option support.
 
 ## The workflow
 
@@ -93,6 +121,11 @@ name: release
 on:
   push:
     tags: ['v*']
+
+env:
+  # Pin it. One place to bump, and a Forge release cannot silently change what
+  # this job produces. See the version note under "Getting lwforge and lwstub".
+  FORGE_VERSION: v0.2.0
 
 jobs:
   release:
@@ -147,7 +180,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FORGE_TOKEN }}
         run: |
-          gh release download v0.1.0 --repo Locke-Werks/Forge `
+          gh release download $env:FORGE_VERSION --repo Locke-Werks/Forge `
             --pattern '*.exe' --dir tools
           foreach ($name in 'lwforge.exe', 'lwstub.exe') {
             $sig = Get-AuthenticodeSignature "tools/$name"
@@ -208,6 +241,55 @@ jobs:
             --repo "${{ github.repository }}" `
             --title "MyApp ${{ github.ref_name }}"
 ```
+
+## Options and per-user hooks in an unattended install
+
+Two things in `installer.toml` change what an unattended deployment does, and
+both are worth checking in the release job rather than discovering on a fleet.
+
+**Options.** `[[options]]` are answered from their `default` when nobody is at
+the keyboard, and overridden with `/O:<id>=off`. An id the installer does not
+declare fails with 1603 before anything is written, so a rename between versions
+breaks the deployment loudly instead of quietly reverting to the default. Add
+the switches your product ships with to the verify step:
+
+```yaml
+      - name: Verify the option surface
+        shell: pwsh
+        run: |
+          # Lists the effective option set after the command line. This is the
+          # check that catches a /O: switch the installer no longer recognises.
+          $report = & dist/MyApp-Setup.exe --check-only /O:desktop_shortcut=off 2>&1 | Out-String
+          $report
+          if ($LASTEXITCODE -ne 0) { throw "check-only exited $LASTEXITCODE`n$report" }
+```
+
+Print the report and put it in the thrown message, because the exit code alone
+does not say which of two things went wrong. `--check-only` returns 1603 both
+for an option id the installer does not declare and for a preflight the runner
+fails, and a runner failing `free_disk_space` or `process_not_running` is a
+property of the runner rather than a defect in the installer. The text
+distinguishes them; the code does not.
+
+The option check happens first, before any preflight runs and before anything is
+written, so a typo costs nothing and reports itself immediately.
+
+**Per-user hooks.** A hook declared `as = "user"` runs as the interactive user.
+Under Intune or SCCM the installer runs as SYSTEM, and at the login screen there
+is no interactive user to hand the work to. The hook is skipped and reported as
+a warning, or fails the install if it is marked `vital`.
+
+That is a real machine state, not a misconfiguration, and it is a design
+decision for the product rather than something CI can fix. If the per-user step
+must happen for a machine-wide deployment, either mark it `vital` and accept
+that installs at the login screen fail, or have the product do that work on
+first run and use the hook only for the interactive case.
+
+**Signing still applies to hook binaries.** A hook can only run a payload
+member. Payload members are extracted verbatim, so a hook binary is signed only
+if it was signed before staging. Signing the installer does nothing for it. This
+is the same rule as everything else in the payload, but a hook is a new reason
+to be shipping an executable that nobody thought of as a product binary.
 
 ## One-time setup per consuming repository
 
@@ -330,6 +412,11 @@ Three checks, each of which has caught a real failure:
 | `0x80080057` | The file is 4 GB or larger | `lwforge` refuses earlier with a clearer message |
 | Signature valid today, invalid next week | `timestamp-rfc3161` omitted | Certificates last three days; timestamping is mandatory |
 | Job never starts | `environment: release` has required reviewers | Approve the deployment, or drop the gate |
+| Exit 1603, nothing written, message names an option | A `/O:` switch the installer does not declare | Run `--check-only` to list the ids this version declares |
+| A `when` fires unconditionally, `/O:` is ignored instead of rejected, or an `as = "user"` hook runs elevated | `FORGE_VERSION` pinned to v0.2.0 or earlier, which predates `[[options]]` | Bump the pin; `--check-only` prints no `options` block on a build with no option support |
+| `when names "x", which is not a declared option` | An option was renamed on one side only | Fix the `when`, or restore the id |
+| Per-user hook warned as skipped on a fleet | Installed as SYSTEM with nobody logged in | Expected. Do that work on first run, or mark the hook `vital` and accept the failure |
+| Files land in the wrong profile, or owned by Administrators | The hook is missing `as = "user"` | Add it; the elevated token is not the user's |
 
 ## If you build Forge from source instead
 

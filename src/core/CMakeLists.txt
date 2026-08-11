@@ -6,6 +6,7 @@ add_library(lwi_core STATIC
     pe_layout.cpp
     container.cpp
     config.cpp
+    options.cpp
     version.cpp
 )
 

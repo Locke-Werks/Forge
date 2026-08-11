@@ -14,6 +14,7 @@ add_executable(lwstub WIN32
     journal.cpp
     services.cpp
     theme.cpp
+    usercontext.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/stub.rc"
 )
 
@@ -35,6 +36,8 @@ target_link_libraries(lwstub PRIVATE
     comctl32
     advapi32
     rstrtmgr    # Restart Manager, for finding what holds a file open
+    userenv     # CreateEnvironmentBlock, for running a hook as the real user
+    wtsapi32    # WTSQueryUserToken, for the same thing under a deployment tool
 )
 
 lwi_apply_warnings(lwstub)

@@ -12,6 +12,7 @@
 
 #include "lwi/config.h"
 #include "lwi/container.h"
+#include "ops.h"
 #include "theme.h"
 
 namespace lwi::stub
@@ -20,6 +21,7 @@ namespace lwi::stub
 enum class Page
 {
     License,
+    Options,
     Progress,
     Complete,
     Error,
@@ -52,6 +54,24 @@ class Wizard
     [[nodiscard]] const std::wstring& install_dir() const { return install_dir_; }
     void set_install_dir(std::wstring dir) { install_dir_ = std::move(dir); }
 
+    /// The options as the config declared them and the command line amended
+    /// them. The wizard owns them from here until the install starts, so the
+    /// page and the engine cannot end up with two different answers.
+    ///
+    /// Invalidates, because init() shows the window and paints it once before
+    /// this is ever called. Without that the license page's button read INSTALL
+    /// on an installer that had an options page still to come, and corrected
+    /// itself the first time the mouse moved.
+    void set_options(std::vector<InstallOption> options)
+    {
+        options_ = std::move(options);
+        if (hwnd_ != nullptr)
+        {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    }
+    [[nodiscard]] const std::vector<InstallOption>& options() const { return options_; }
+
   private:
     static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT handle(HWND, UINT, WPARAM, LPARAM);
@@ -62,6 +82,12 @@ class Wizard
     void layout_hit_regions(float width, float height);
     void apply_window_attributes();
     void on_click(float x, float y);
+    void begin_install();
+
+    /// Leaves the license page: to the options when there are any to show,
+    /// straight into the install when there are not, so an installer that
+    /// declares no options looks exactly as it did before.
+    void advance_from_license();
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
@@ -83,6 +109,12 @@ class Wizard
     bool hover_primary_ = false;
     float scroll_ = 0.0f;
     float scroll_max_ = 0.0f;
+
+    std::vector<InstallOption> options_;
+    std::vector<D2D1_RECT_F> rc_options_;
+    // Which row the keyboard is on. -1 until an arrow key is pressed, so a
+    // mouse user never sees a focus ring they did not ask for.
+    int option_focus_ = -1;
 
     std::mutex state_lock_;
     float progress_ = 0.0f;

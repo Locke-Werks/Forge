@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "checks.h"
@@ -44,6 +45,12 @@ struct Options
     bool uninstall = false;
     std::wstring dir;
 
+    // Option overrides in the order they were given, id to state. Kept as
+    // written rather than applied here, because nothing has read the config yet
+    // and an id cannot be checked against a list that does not exist.
+    std::vector<std::pair<std::string, bool>> option_overrides;
+    std::wstring bad_option;
+
     // Set on the temp-directory copy of the uninstaller. It waits for the
     // original to exit, then removes the directory the original was running
     // from. A process cannot unlink its own running image, so the last step of
@@ -51,6 +58,43 @@ struct Options
     std::wstring finish_dir;
     DWORD wait_for_pid = 0;
 };
+
+/// Parses "id=value" for /O: and --option.
+///
+/// The spellings are the ones people already type at other installers, because
+/// the alternative is that a deployment engineer reads documentation to say yes
+/// to a checkbox.
+bool parse_option_override(const std::wstring& text, std::pair<std::string, bool>& out)
+{
+    const size_t equals = text.find(L'=');
+    if (equals == std::wstring::npos || equals == 0)
+    {
+        return false;
+    }
+
+    std::wstring value = text.substr(equals + 1);
+    for (wchar_t& c : value)
+    {
+        c = static_cast<wchar_t>(towlower(c));
+    }
+
+    bool state = false;
+    if (value == L"1" || value == L"true" || value == L"on" || value == L"yes")
+    {
+        state = true;
+    }
+    else if (value == L"0" || value == L"false" || value == L"off" || value == L"no")
+    {
+        state = false;
+    }
+    else
+    {
+        return false;
+    }
+
+    out = {to_utf8(text.substr(0, equals)), state};
+    return true;
+}
 
 Options parse_command_line()
 {
@@ -98,6 +142,31 @@ Options parse_command_line()
             const size_t eq = arg.find(L'=');
             options.dir = arg.substr(eq + 1);
         }
+        else if (upper.rfind(L"/O:", 0) == 0 || upper.rfind(L"-O:", 0) == 0)
+        {
+            std::pair<std::string, bool> override_value;
+            if (parse_option_override(arg.substr(3), override_value))
+            {
+                options.option_overrides.push_back(std::move(override_value));
+            }
+            else if (options.bad_option.empty())
+            {
+                options.bad_option = arg;
+            }
+        }
+        else if (upper == L"--OPTION" && i + 1 < count)
+        {
+            const std::wstring value = argv[++i];
+            std::pair<std::string, bool> override_value;
+            if (parse_option_override(value, override_value))
+            {
+                options.option_overrides.push_back(std::move(override_value));
+            }
+            else if (options.bad_option.empty())
+            {
+                options.bad_option = value;
+            }
+        }
     }
 
     LocalFree(argv);
@@ -133,6 +202,50 @@ std::wstring known_folder(REFKNOWNFOLDERID id)
     std::wstring out(path);
     CoTaskMemFree(path);
     return out;
+}
+
+/// Applies the command line's option overrides onto the plan.
+///
+/// An id the config never declared is an error rather than something to ignore.
+/// Ignoring it is the worst outcome available: the operator believes they turned
+/// something off, the default stays on, and the only evidence is on machines
+/// nobody is looking at. lwforge cannot catch this one, because the command line
+/// is written long after the build.
+bool apply_option_overrides(const Options& options, InstallPlan& plan, std::string& error)
+{
+    if (!options.bad_option.empty())
+    {
+        error = "not a valid option override: " + to_utf8(options.bad_option) +
+                "\nexpected /O:<id>=<on|off>";
+        return false;
+    }
+
+    for (const auto& [id, state] : options.option_overrides)
+    {
+        const auto found = std::find_if(plan.options.begin(), plan.options.end(),
+                                        [&id](const InstallOption& option) {
+                                            return option.id == id;
+                                        });
+        if (found == plan.options.end())
+        {
+            error = "there is no option named \"" + id + "\"";
+            if (plan.options.empty())
+            {
+                error += "; this installer declares none";
+            }
+            else
+            {
+                error += "; it declares:";
+                for (const InstallOption& option : plan.options)
+                {
+                    error += "\n  " + option.id;
+                }
+            }
+            return false;
+        }
+        found->selected = state;
+    }
+    return true;
 }
 
 /// Expands the tokens allowed in install.dir.
@@ -405,7 +518,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
                       to_wide(config.get("product.name", "Application"));
     }
 
-    const InstallPlan plan = plan_from_config(config, install_dir);
+    InstallPlan plan = plan_from_config(config, install_dir);
+
+    // Before anything else looks at the plan, and before the mutex is taken, so
+    // a typo on the command line costs nothing and reports itself immediately.
+    if (std::string error; !apply_option_overrides(options, plan, error))
+    {
+        if (options.silent || options.check_only)
+        {
+            write_console("lwi: " + error + "\n");
+        }
+        else
+        {
+            MessageBoxW(nullptr, to_wide(error).c_str(), L"Setup", MB_ICONERROR | MB_OK);
+        }
+        return kExitFailure;
+    }
 
     if (options.check_only)
     {
@@ -425,6 +553,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
         if (reader.is_dev_build())
         {
             report += "build       UNSIGNED DEV BUILD\n";
+        }
+
+        // The effective option set, after the command line. A deployment tool
+        // runs --check-only first to decide whether to bother, and this is the
+        // only place it can confirm that the /O: switches it passed were spelled
+        // the way the installer spells them.
+        if (!plan.options.empty())
+        {
+            report += "\noptions\n";
+            for (const InstallOption& option : plan.options)
+            {
+                report += std::string("  ") + (option.selected ? "[x] " : "[ ] ") + option.id +
+                          "   " + to_utf8(option.label) + "\n";
+            }
         }
 
         const std::vector<CheckOutcome> outcomes = run_preflight(config, plan);
@@ -499,6 +641,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             return kExitFailure;
         }
         wizard.set_install_dir(install_dir);
+        // The wizard owns the answers from here. The plan keeps the defaults the
+        // config and the command line settled on, and the chosen set is read
+        // back once, at the moment the install starts.
+        wizard.set_options(plan.options);
 
         // A machine that does not qualify is told so before it is shown a
         // license to accept. Presenting the license first and failing after
@@ -537,8 +683,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             // COM apartments are per thread, and this thread creates shortcuts.
             const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
+            InstallPlan chosen = plan;
+            chosen.options = wizard.options();
+
             const Status s =
-                run_install(reader, config, plan, [&](float fraction, const std::wstring& status) {
+                run_install(reader, config, chosen, [&](float fraction, const std::wstring& status) {
                     if (wizard.cancelled())
                     {
                         return false;

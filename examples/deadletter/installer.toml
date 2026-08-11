@@ -21,12 +21,10 @@ aumid        = "LockeWerks.DeadLetter"
 [install]
 scope     = "machine"
 dir       = "{ProgramFiles}\\DeadLetter"
-# Overrides the default of required. on-demand keeps the wizard unelevated so
-# the license and warnings are visible before any UAC prompt, and so per-user
-# work happens in the invoking user's token. The trade is that nothing elevates
-# later, so a machine-scope install like this one has to be started from an
-# elevated context. Drop this line to get a UAC prompt up front instead.
-elevation = "on-demand"
+# The default. A machine-scope install writes to Program Files and HKLM, so it
+# needs the rights up front. Per-user work does not go through this setting:
+# see the post_install hook below, which drops back to the invoking user.
+elevation = "required"
 
 [ui]
 warning = "DeadLetter rebuilds your mail store index on first run. Existing mail is not modified."
@@ -58,6 +56,21 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # [ui.theme]
 # accent = "#00cccc"
 
+# Things the person installing gets to decide. Shown on a page between the
+# license and the progress bar, and settable unattended as
+# /O:desktop_shortcut=off. Recorded in the install manifest, so uninstall gates
+# on the same answers rather than re-reading these defaults.
+[[options]]
+id      = "desktop_shortcut"
+label   = "Put a shortcut on the desktop"
+default = false
+
+[[options]]
+id      = "user_profile"
+label   = "Set up my mail profile"
+detail  = "Writes to your own profile directory. Runs as you, not as the administrator."
+default = true
+
 [[preflight]]
 type = "os_build"
 min  = 17763
@@ -85,11 +98,21 @@ where  = "common_programs"
 name   = "DeadLetter"
 
 [[actions]]
+type   = "shortcut"
+target = "{InstallDir}\\bin\\deadletter.exe"
+where  = "desktop"
+name   = "DeadLetter"
+# Only created if the box was ticked. An undeclared id here fails the build,
+# so renaming an option cannot leave a declaration that silently never fires.
+when   = "desktop_shortcut"
+
+[[actions]]
+# Takes no keys of its own. DisplayName, Publisher, DisplayVersion and
+# EstimatedSize are derived from [product] and the payload rather than restated,
+# so the ARP entry and the winget manifest cannot disagree about what version
+# this is. QuietUninstallString is always written, because that is what Intune,
+# SCCM and winget actually invoke.
 type = "arp"
-# DisplayName, Publisher, DisplayVersion and EstimatedSize are derived from
-# [product] and the payload rather than restated, so the ARP entry and the
-# winget manifest cannot disagree about what version this is.
-quiet_uninstall = true
 
 [[hooks.post_install]]
 id     = "register_daemon"
@@ -105,3 +128,24 @@ sha256 = "auto"
 expect_exit = [0]
 timeout_ms = 30000
 vital = false
+
+# The per-user half of the install. as = "user" runs this unelevated, as
+# whoever started setup, with their environment, so {UserLocalAppData} is their
+# profile and the files it writes are owned by them.
+#
+# Without it, an installer that elevated writes into the administrator's profile
+# under over-the-shoulder UAC, and even in the ordinary case leaves files owned
+# by BUILTIN\Administrators that the product cannot rewrite later. Both failures
+# are silent.
+#
+# Digest pinning is unchanged: it is checked by the elevated process before the
+# token is dropped.
+[[hooks.post_install]]
+id     = "user_profile"
+run    = "payload:bin\\deadletter.exe"
+as     = "user"
+when   = "user_profile"
+args   = ["--first-run", "{UserLocalAppData}\\DeadLetter"]
+sha256 = "auto"
+timeout_ms = 60000
+vital  = false

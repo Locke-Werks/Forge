@@ -14,6 +14,7 @@
 #include "journal.h"
 #include "services.h"
 #include "hooks.h"
+#include "lwi/options.h"
 #include "lwi/win_file.h"
 
 namespace lwi::stub
@@ -117,6 +118,35 @@ std::wstring today_stamp()
 std::wstring quote(const std::wstring& s)
 {
     return L"\"" + s + L"\"";
+}
+
+/// One place that turns hook outcomes into operator-visible warnings, so the
+/// phases cannot describe the same failure three different ways.
+///
+/// A per-user hook names the account it ran as. "hook configure failed" and
+/// "hook configure failed as CONTOSO\\jhancuff" are the same sentence until you
+/// are the one reading it off a machine where the wrong profile got written.
+void report_hooks(const std::vector<HookOutcome>& outcomes, std::vector<std::string>* warnings)
+{
+    if (warnings == nullptr)
+    {
+        return;
+    }
+    for (const HookOutcome& outcome : outcomes)
+    {
+        if (outcome.ok)
+        {
+            continue;
+        }
+        std::string where = "hook " + outcome.id;
+        if (outcome.context == HookContext::User)
+        {
+            where += " (as ";
+            where += outcome.account.empty() ? "the interactive user" : outcome.account;
+            where += ")";
+        }
+        warnings->push_back(where + ": " + outcome.detail);
+    }
 }
 
 Status delete_tree_entry(const std::wstring& path)
@@ -225,7 +255,57 @@ InstallPlan plan_from_config(const Config& config, const std::wstring& install_d
     plan.aumid = to_wide(config.get("product.aumid"));
     plan.url_about = to_wide(config.get("product.url"));
     plan.install_dir = install_dir_override;
+
+    const size_t option_count = config.array_size("options");
+    for (size_t i = 0; i < option_count; ++i)
+    {
+        const std::string prefix = "options." + std::to_string(i) + ".";
+        InstallOption option;
+        option.id = std::string(config.get(prefix + "id"));
+        if (option.id.empty())
+        {
+            continue;
+        }
+        option.label = to_wide(config.get(prefix + "label", option.id));
+        option.detail = to_wide(config.get(prefix + "detail"));
+        // Omitting `default` means on. An option a product bothered to declare
+        // is one it wants, and this matches what every other installer does with
+        // a component list.
+        option.selected = config.get_bool(prefix + "default", true);
+        plan.options.push_back(std::move(option));
+    }
     return plan;
+}
+
+bool option_selected(const InstallPlan& plan, std::string_view id)
+{
+    for (const InstallOption& option : plan.options)
+    {
+        if (option.id == id)
+        {
+            return option.selected;
+        }
+    }
+    return false;
+}
+
+bool when_satisfied(const Config& config, const std::string& prefix, const InstallPlan& plan)
+{
+    // The terms are views into the config's own storage, which outlives this.
+    const std::string_view expression = config.get(prefix + "when");
+
+    for (const WhenTerm& term : when_terms(expression))
+    {
+        if (term.id.empty())
+        {
+            continue;
+        }
+        if (option_selected(plan, term.id) == term.negated)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 Status InstallRecord::save(const std::wstring& install_dir) const
@@ -262,6 +342,14 @@ Status InstallRecord::save(const std::wstring& install_dir) const
     for (const auto& [key, value] : undo.entries())
     {
         manifest.set("undo." + key, value);
+    }
+
+    // Keyed by id rather than by index, because an id survives the product
+    // reordering its option list between versions and an index does not.
+    // lwforge keeps ids free of dots so the key stays unambiguous.
+    for (const InstallOption& option : options)
+    {
+        manifest.set("options." + option.id, option.selected ? "true" : "false");
     }
 
     std::vector<uint8_t> blob;
@@ -319,6 +407,13 @@ Status InstallRecord::load(const std::wstring& install_dir)
         else if (key.rfind("undo.", 0) == 0)
         {
             undo.set(key.substr(5), value);
+        }
+        else if (key.rfind("options.", 0) == 0)
+        {
+            InstallOption option;
+            option.id = key.substr(8);
+            option.selected = value == "true";
+            options.push_back(std::move(option));
         }
     }
 
@@ -616,13 +711,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
     {
         std::vector<HookOutcome> hook_outcomes;
         const bool ok = run_hooks(Phase::PostExtract, config, plan, hook_outcomes);
-        for (const HookOutcome& outcome : hook_outcomes)
-        {
-            if (!outcome.ok && warnings != nullptr)
-            {
-                warnings->push_back("hook " + outcome.id + ": " + outcome.detail);
-            }
-        }
+        report_hooks(hook_outcomes, warnings);
         if (!ok)
         {
             return abort(Status::error(Code::IoError, "a required post_extract hook failed"));
@@ -632,13 +721,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
     {
         std::vector<HookOutcome> hook_outcomes;
         const bool ok = run_hooks(Phase::PreRegister, config, plan, hook_outcomes);
-        for (const HookOutcome& outcome : hook_outcomes)
-        {
-            if (!outcome.ok && warnings != nullptr)
-            {
-                warnings->push_back("hook " + outcome.id + ": " + outcome.detail);
-            }
-        }
+        report_hooks(hook_outcomes, warnings);
         if (!ok)
         {
             return abort(Status::error(Code::IoError, "a required pre_register hook failed"));
@@ -652,6 +735,10 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
     {
         const std::string prefix = "actions." + std::to_string(i) + ".";
         if (config.get(prefix + "type") != "shortcut")
+        {
+            continue;
+        }
+        if (!when_satisfied(config, prefix, plan))
         {
             continue;
         }
@@ -729,6 +816,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
             record.hooks.set(key, value);
         }
     }
+    record.options = plan.options;
 
     if (Status s = record.save(plan.install_dir); !s)
     {
@@ -738,13 +826,7 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
     {
         std::vector<HookOutcome> hook_outcomes;
         const bool ok = run_hooks(Phase::PostInstall, config, plan, hook_outcomes);
-        for (const HookOutcome& outcome : hook_outcomes)
-        {
-            if (!outcome.ok && warnings != nullptr)
-            {
-                warnings->push_back("hook " + outcome.id + ": " + outcome.detail);
-            }
-        }
+        report_hooks(hook_outcomes, warnings);
         if (!ok)
         {
             return abort(Status::error(Code::IoError, "a required post_install hook failed"));
@@ -776,9 +858,11 @@ Status run_uninstall(const std::wstring& install_dir)
     InstallPlan plan;
     plan.install_dir = install_dir;
     plan.scope = record.scope;
+    // The answers the install was given, so a `when` on an uninstall hook is
+    // evaluated against what the user actually chose rather than the defaults.
+    plan.options = record.options;
 
     {
-        std::vector<HookOutcome> hook_outcomes;
         // Not fatal. Refusing to uninstall because the product's own cleanup
         // hook failed leaves the user with something they cannot remove, which
         // is worse than removing it with the cleanup half done.
@@ -789,6 +873,28 @@ Status run_uninstall(const std::wstring& install_dir)
     for (const std::wstring& shortcut : record.shortcuts)
     {
         delete_tree_entry(shortcut);
+    }
+
+    // Everything that is not a file, before the files. A service has to be
+    // stopped and deleted while its binary is still on disk, or the delete is
+    // deferred to a reboot and the product looks half removed until then.
+    revert_associations(record);
+    revert_services(record);
+    revert_actions(record);
+
+    if (!record.arp_key.empty())
+    {
+        RegDeleteKeyExW(scope_root(record.scope), (kUninstallPath + record.arp_key).c_str(),
+                        KEY_WOW64_64KEY, 0);
+    }
+
+    // The last point a post_uninstall hook can run, because the hook is a
+    // payload member and a deleted binary cannot be executed. Everything
+    // registered is already gone, which is what the phase promises; what is left
+    // is the files and the directory holding them.
+    {
+        std::vector<HookOutcome> ignored;
+        run_hooks(Phase::PostUninstall, record.hooks, plan, ignored);
     }
 
     for (const std::wstring& relative : record.files)
@@ -803,16 +909,6 @@ Status run_uninstall(const std::wstring& install_dir)
     for (const std::wstring& dir : dirs)
     {
         RemoveDirectoryW(long_path(install_dir + L"\\" + dir).c_str());
-    }
-
-    revert_associations(record);
-    revert_services(record);
-    revert_actions(record);
-
-    if (!record.arp_key.empty())
-    {
-        RegDeleteKeyExW(scope_root(record.scope), (kUninstallPath + record.arp_key).c_str(),
-                        KEY_WOW64_64KEY, 0);
     }
 
     // The manifest, then the meta directory, then the install directory itself.

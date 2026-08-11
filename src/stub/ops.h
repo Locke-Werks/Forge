@@ -19,6 +19,20 @@ enum class Scope
     User,
 };
 
+/// One thing the person installing can say yes or no to.
+///
+/// Declared in the config, defaulted there, overridable on the command line and
+/// then on the options page. Whatever it ends up as travels on the plan, so
+/// actions, services, associations and hooks all read the same answer rather
+/// than each deciding for themselves what "selected" meant.
+struct InstallOption
+{
+    std::string id;
+    std::wstring label;
+    std::wstring detail;
+    bool selected = false;
+};
+
 struct InstallPlan
 {
     Scope scope = Scope::Machine;
@@ -29,9 +43,28 @@ struct InstallPlan
     std::wstring upgrade_code;
     std::wstring aumid;
     std::wstring url_about;
+    std::vector<InstallOption> options;
 };
 
 InstallPlan plan_from_config(const Config& config, const std::wstring& install_dir_override);
+
+/// True when an option was declared and is selected.
+///
+/// An id that was never declared reads as not selected. lwforge rejects a `when`
+/// naming an undeclared option at build time, so reaching this at runtime means
+/// the config was not built by lwforge, and doing less is the safe reading of a
+/// condition nobody can evaluate.
+[[nodiscard]] bool option_selected(const InstallPlan& plan, std::string_view id);
+
+/// Evaluates the `when` key at "<prefix>when", which gates a declaration on the
+/// options that were chosen.
+///
+/// The grammar is a comma separated list of option ids, each optionally prefixed
+/// with '!', all of which must hold. Absent or empty means yes. It is
+/// deliberately not an expression language: the stub runs elevated, and a parser
+/// is a parser.
+[[nodiscard]] bool when_satisfied(const Config& config, const std::string& prefix,
+                                  const InstallPlan& plan);
 
 /// Everything an install created, recorded as it happens.
 ///
@@ -66,6 +99,12 @@ struct InstallRecord
     /// unconditionally destroys a setting the machine already had, and leaving
     /// it alone orphans one the install created.
     Config undo;
+
+    /// The options as they were answered, so uninstall gates on the same
+    /// answers. Without this an uninstall hook guarded by `when` would re-read
+    /// the defaults and run cleanup for something the user never chose, or skip
+    /// cleanup for something they did.
+    std::vector<InstallOption> options;
 
     Status save(const std::wstring& install_dir) const;
     Status load(const std::wstring& install_dir);

@@ -198,13 +198,12 @@ int Wizard::run()
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
-        // IsDialogMessage gives Tab, Shift-Tab and Enter their standard meaning
-        // without a dialog template.
-        if (!IsDialogMessageW(hwnd_, &msg))
-        {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        // No IsDialogMessage. The window is owner-drawn and owns no child
+        // controls, so there is nothing for it to move focus between; all it
+        // does here is swallow Enter and the arrow keys, which are how the
+        // options page is driven without a mouse.
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
     return static_cast<int>(msg.wParam);
 }
@@ -310,7 +309,7 @@ LRESULT Wizard::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_MOUSEWHEEL:
-        if (page_ == Page::License)
+        if (page_ == Page::License || page_ == Page::Options)
         {
             const int delta = GET_WHEEL_DELTA_WPARAM(wp);
             scroll_ = (std::max)(0.0f, (std::min)(scroll_max_, scroll_ - delta * 0.4f));
@@ -330,10 +329,45 @@ LRESULT Wizard::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
         }
-        else if (wp == VK_SPACE && page_ == Page::License)
+        else if (page_ == Page::License)
         {
-            accepted_ = !accepted_;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (wp == VK_SPACE)
+            {
+                accepted_ = !accepted_;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (wp == VK_RETURN && accepted_)
+            {
+                advance_from_license();
+            }
+        }
+        else if (page_ == Page::Options && !options_.empty())
+        {
+            if (wp == VK_DOWN || wp == VK_UP)
+            {
+                const int last = static_cast<int>(options_.size()) - 1;
+                if (option_focus_ < 0)
+                {
+                    option_focus_ = 0;
+                }
+                else
+                {
+                    option_focus_ = wp == VK_DOWN ? (std::min)(last, option_focus_ + 1)
+                                                  : (std::max)(0, option_focus_ - 1);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (wp == VK_SPACE && option_focus_ >= 0 &&
+                     option_focus_ < static_cast<int>(options_.size()))
+            {
+                options_[static_cast<size_t>(option_focus_)].selected =
+                    !options_[static_cast<size_t>(option_focus_)].selected;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (wp == VK_RETURN)
+            {
+                begin_install();
+            }
         }
         return 0;
 
@@ -363,6 +397,32 @@ LRESULT Wizard::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+void Wizard::advance_from_license()
+{
+    if (options_.empty())
+    {
+        begin_install();
+        return;
+    }
+    page_ = Page::Options;
+    scroll_ = 0.0f;
+    scroll_max_ = 0.0f;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void Wizard::begin_install()
+{
+    page_ = Page::Progress;
+    scroll_ = 0.0f;
+    SetTimer(hwnd_, kAnimationTimer, kAnimationIntervalMs, nullptr);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+
+    if (install_)
+    {
+        std::thread(install_).detach();
+    }
+}
+
 void Wizard::on_click(float x, float y)
 {
     if (contains(rc_close_, x, y))
@@ -381,14 +441,32 @@ void Wizard::on_click(float x, float y)
         }
         if (contains(rc_primary_, x, y) && accepted_)
         {
-            page_ = Page::Progress;
-            SetTimer(hwnd_, kAnimationTimer, kAnimationIntervalMs, nullptr);
-            InvalidateRect(hwnd_, nullptr, FALSE);
-
-            if (install_)
+            advance_from_license();
+            return;
+        }
+    }
+    else if (page_ == Page::Options)
+    {
+        // The whole row is the target, not just the box. A 20 by 20 checkbox is
+        // a miss waiting to happen, and every other list of choices on the
+        // platform toggles from the label too.
+        if (contains(rc_license_, x, y))
+        {
+            for (size_t i = 0; i < rc_options_.size() && i < options_.size(); ++i)
             {
-                std::thread(install_).detach();
+                if (contains(rc_options_[i], x, y))
+                {
+                    options_[i].selected = !options_[i].selected;
+                    option_focus_ = static_cast<int>(i);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return;
+                }
             }
+            return;
+        }
+        if (contains(rc_primary_, x, y))
+        {
+            begin_install();
             return;
         }
     }
@@ -494,6 +572,32 @@ void Wizard::layout_hit_regions(float width, float height)
     rc_license_ = D2D1::RectF(32.0f, 168.0f, width - 32.0f, height - 108.0f - warning_band);
     rc_checkbox_ = D2D1::RectF(32.0f, height - 94.0f, 52.0f, height - 74.0f);
     rc_primary_ = D2D1::RectF(width - 192.0f, height - 60.0f, width - 32.0f, height - 20.0f);
+
+    // The options reuse the license card. Nothing else needs the space, and two
+    // differently sized cards a click apart reads as the window resizing.
+    if (page_ == Page::Options)
+    {
+        // The card grows into the band the license page reserves for its
+        // checkbox, since there is no checkbox here.
+        rc_license_.bottom = height - 76.0f;
+
+        rc_options_.clear();
+        const float left = rc_license_.left + 20.0f;
+        const float right = rc_license_.right - 20.0f;
+        const float top = rc_license_.top + 16.0f;
+        float y = top - scroll_;
+
+        for (const InstallOption& option : options_)
+        {
+            const float row = option.detail.empty() ? 34.0f : 54.0f;
+            rc_options_.push_back(D2D1::RectF(left, y, right, y + row - 8.0f));
+            y += row;
+        }
+
+        const float content = (y + scroll_) - top;
+        const float visible = (rc_license_.bottom - 16.0f) - top;
+        scroll_max_ = (std::max)(0.0f, content - visible);
+    }
 }
 
 void Wizard::paint()
@@ -577,10 +681,26 @@ void Wizard::paint()
         rt->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush, 1.0f);
     };
 
+    // One checkbox, drawn the same on the license page and in the option list.
+    // They were two copies of the same six lines and had already drifted by a
+    // pixel.
+    const auto checkbox = [&](const D2D1_RECT_F& box, bool on, uint32_t edge) {
+        stroke_round(box, 4.0f, edge);
+        if (!on)
+        {
+            return;
+        }
+        set(theme_.accent);
+        rt->DrawLine(D2D1::Point2F(box.left + 5.0f, box.top + 10.0f),
+                     D2D1::Point2F(box.left + 8.5f, box.top + 14.0f), brush, 2.0f);
+        rt->DrawLine(D2D1::Point2F(box.left + 8.5f, box.top + 14.0f),
+                     D2D1::Point2F(box.left + 15.0f, box.top + 6.0f), brush, 2.0f);
+    };
+
     // Header. The "//" prefix is a recurring mark in the Locke Werks and
     // Specter Point systems and carries into the installer.
-    tracked(L"// INSTALL", res_->eyebrow.Get(), D2D1::RectF(32.0f, 60.0f, width - 32.0f, 82.0f),
-            theme_.accent, 0.20f, 11.0f);
+    tracked(page_ == Page::Options ? L"// OPTIONS" : L"// INSTALL", res_->eyebrow.Get(),
+            D2D1::RectF(32.0f, 60.0f, width - 32.0f, 82.0f), theme_.accent, 0.20f, 11.0f);
 
     std::wstring heading = product_;
     std::transform(heading.begin(), heading.end(), heading.begin(),
@@ -611,10 +731,38 @@ void Wizard::paint()
         const D2D1_RECT_F inner = D2D1::RectF(rc_license_.left + 20.0f, rc_license_.top + 16.0f,
                                               rc_license_.right - 20.0f, rc_license_.bottom - 16.0f);
         rt->PushAxisAlignedClip(inner, D2D1_ANTIALIAS_MODE_ALIASED);
-        const D2D1_RECT_F scrolled =
-            D2D1::RectF(inner.left, inner.top - scroll_, inner.right, inner.top - scroll_ + 4000.0f);
-        text(license_.empty() ? L"No license text was supplied." : license_, res_->body.Get(),
-             scrolled, theme_.text_body);
+
+        // Laid out rather than drawn straight, because the layout is the only
+        // thing that knows how tall the text came out, and without that number
+        // scroll_max_ stays zero and the wheel does nothing. A license longer
+        // than the card was unreadable past the fold and there was no way to get
+        // at the rest of it, on a page whose entire purpose is informed consent.
+        const std::wstring shown =
+            license_.empty() ? std::wstring(L"No license text was supplied.") : license_;
+        ComPtr<IDWriteTextLayout> layout;
+        // The layout box is deliberately taller than the card and the draw is
+        // deliberately unclipped: the clip option clips to the LAYOUT box, which
+        // moves with the scroll offset, so it would eat the bottom of the card
+        // by exactly the amount scrolled. The card's own clip is what bounds it.
+        if (SUCCEEDED(res_->dwrite->CreateTextLayout(
+                shown.data(), static_cast<UINT32>(shown.size()), res_->body.Get(),
+                inner.right - inner.left, 1.0e6f, layout.GetAddressOf())))
+        {
+            DWRITE_TEXT_METRICS metrics{};
+            layout->GetMetrics(&metrics);
+            scroll_max_ = (std::max)(0.0f, metrics.height - (inner.bottom - inner.top));
+            scroll_ = (std::min)(scroll_, scroll_max_);
+
+            set(theme_.text_body);
+            rt->DrawTextLayout(D2D1::Point2F(inner.left, inner.top - scroll_), layout.Get(), brush,
+                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        else
+        {
+            const D2D1_RECT_F scrolled = D2D1::RectF(inner.left, inner.top - scroll_, inner.right,
+                                                     inner.top - scroll_ + 4000.0f);
+            text(shown, res_->body.Get(), scrolled, theme_.text_body);
+        }
         rt->PopAxisAlignedClip();
 
         if (!warning_.empty())
@@ -625,18 +773,7 @@ void Wizard::paint()
                  theme_.error);
         }
 
-        // Checkbox.
-        stroke_round(rc_checkbox_, 4.0f, accepted_ ? theme_.accent : theme_.border);
-        if (accepted_)
-        {
-            set(theme_.accent);
-            rt->DrawLine(D2D1::Point2F(rc_checkbox_.left + 5.0f, rc_checkbox_.top + 10.0f),
-                         D2D1::Point2F(rc_checkbox_.left + 8.5f, rc_checkbox_.top + 14.0f), brush,
-                         2.0f);
-            rt->DrawLine(D2D1::Point2F(rc_checkbox_.left + 8.5f, rc_checkbox_.top + 14.0f),
-                         D2D1::Point2F(rc_checkbox_.left + 15.0f, rc_checkbox_.top + 6.0f), brush,
-                         2.0f);
-        }
+        checkbox(rc_checkbox_, accepted_, accepted_ ? theme_.accent : theme_.border);
         text(L"I accept the license terms", res_->small_text.Get(),
              D2D1::RectF(rc_checkbox_.right + 10.0f, rc_checkbox_.top + 1.0f,
                          rc_primary_.left - 12.0f, rc_checkbox_.bottom + 4.0f),
@@ -650,8 +787,63 @@ void Wizard::paint()
             fill_round(rc_primary_, theme_.radius_button, theme_.accent_soft);
         }
         stroke_round(rc_primary_, theme_.radius_button, edge);
-        tracked(L"INSTALL", res_->button.Get(), rc_primary_,
+        tracked(options_.empty() ? L"INSTALL" : L"CONTINUE", res_->button.Get(), rc_primary_,
                 accepted_ ? theme_.accent : theme_.text_faint, 0.10f, 12.0f);
+        break;
+    }
+
+    case Page::Options:
+    {
+        fill_round(rc_license_, theme_.radius_card, theme_.surface);
+        stroke_round(rc_license_, theme_.radius_card, theme_.border);
+
+        rt->PushAxisAlignedClip(rc_license_, D2D1_ANTIALIAS_MODE_ALIASED);
+        for (size_t i = 0; i < options_.size() && i < rc_options_.size(); ++i)
+        {
+            const D2D1_RECT_F& row = rc_options_[i];
+            if (row.bottom < rc_license_.top || row.top > rc_license_.bottom)
+            {
+                continue;
+            }
+
+            const bool on = options_[i].selected;
+            const bool focused = option_focus_ == static_cast<int>(i);
+
+            // The focus mark is the row wash, not the box edge. Tinting the
+            // edge cannot show focus on a row that is already ticked, because a
+            // ticked box is already drawn in the accent colour, and a keyboard
+            // user then has no way to tell which row Space is about to toggle.
+            if (focused)
+            {
+                fill_round(D2D1::RectF(row.left - 8.0f, row.top - 5.0f, row.right + 8.0f,
+                                       row.bottom + 5.0f),
+                           6.0f, theme_.accent_soft);
+            }
+
+            const D2D1_RECT_F box =
+                D2D1::RectF(row.left, row.top, row.left + 20.0f, row.top + 20.0f);
+            checkbox(box, on, on ? theme_.accent : theme_.border);
+
+            text(options_[i].label, res_->small_text.Get(),
+                 D2D1::RectF(box.right + 12.0f, box.top + 1.0f, row.right, box.bottom + 4.0f),
+                 on ? theme_.text : theme_.text_muted);
+
+            if (!options_[i].detail.empty())
+            {
+                text(options_[i].detail, res_->small_text.Get(),
+                     D2D1::RectF(box.right + 12.0f, box.bottom + 2.0f, row.right, row.bottom + 4.0f),
+                     theme_.text_faint);
+            }
+        }
+        rt->PopAxisAlignedClip();
+
+        if (hover_primary_)
+        {
+            fill_round(rc_primary_, theme_.radius_button, theme_.accent_soft);
+        }
+        stroke_round(rc_primary_, theme_.radius_button,
+                     hover_primary_ ? theme_.accent : theme_.border_hover);
+        tracked(L"INSTALL", res_->button.Get(), rc_primary_, theme_.accent, 0.10f, 12.0f);
         break;
     }
 
