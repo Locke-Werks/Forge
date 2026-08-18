@@ -1,4 +1,18 @@
+<div align="center">
+
+<img src="assets/forge.ico" width="96" alt="Forge">
+
 # Forge
+
+**A universal Windows installer: one signed stub, compiled once, stamped per product.**
+
+[![release](https://img.shields.io/github/v/release/Locke-Werks/Forge?style=flat-square&color=d6262a)](https://github.com/Locke-Werks/Forge/releases)
+[![license](https://img.shields.io/badge/license-MIT-d6262a?style=flat-square)](LICENSE)
+![platform](https://img.shields.io/badge/platform-Windows%20x64-d6262a?style=flat-square)
+
+</div>
+
+---
 
 LockeWerks Forge. A universal, extensible Windows installer: one signed stub,
 compiled once, plus a packaging tool that stamps a product's configuration and
