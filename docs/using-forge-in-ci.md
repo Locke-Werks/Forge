@@ -310,11 +310,12 @@ gh secret   set AZURE_CLIENT_SECRET --repo OWNER/NAME --env release
 gh secret   set FORGE_TOKEN --repo OWNER/NAME
 ```
 
-The tenant and client IDs and the secret are in
-`C:\Users\vexam\projects\azure signing creds.txt`. The service principal already
-holds **Artifact Signing Certificate Profile Signer** at the
-`certificateProfiles/specterpoint` scope. Do not create a second app
-registration, a second account, or a second certificate profile.
+The tenant and client IDs and the secret belong to the Azure Trusted Signing
+service principal. Keep them in your own credential store and out of the
+repository. The service principal already holds **Artifact Signing
+Certificate Profile Signer** at the `certificateProfiles/specterpoint`
+scope. Do not create a second app registration, a second account, or a
+second certificate profile.
 
 Splitting across profiles actively costs you. SmartScreen publisher reputation
 accumulates per certificate, and EV certificates no longer bypass SmartScreen,
