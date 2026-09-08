@@ -102,8 +102,8 @@ the check which catches a silently skipped folder.
 ## Releasing
 
 ```
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 The tag runs the full build, then signs `lwforge.exe` and `lwstub.exe` and

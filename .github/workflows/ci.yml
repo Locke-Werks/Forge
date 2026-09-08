@@ -134,6 +134,21 @@ jobs:
         shell: pwsh
         run: ./tests/fault/Run-FaultMatrix.ps1 -Installer dist/DeadLetter-Setup.exe -MaxSteps 14
 
+      # Hooks had no end-to-end coverage: the demo declared two, one of which
+      # left nothing behind and one of which timed out on every install while
+      # the suite called it a pass. This asserts each phase actually ran, in the
+      # right context, with its tokens expanded.
+      - name: Hook matrix
+        shell: pwsh
+        run: ./tests/e2e/Run-HookMatrix.ps1 -Installer dist/DeadLetter-Setup.exe
+
+      # Every one of these used to package clean and then do nothing, or do
+      # something other than what the config said. A build that accepts them is
+      # the failure, so the test is that lwforge refuses.
+      - name: A hook config the stub cannot honour must fail the build
+        shell: pwsh
+        run: ./tests/e2e/Test-RejectedConfigs.ps1
+
       - name: Tampering must be detected
         shell: pwsh
         run: |

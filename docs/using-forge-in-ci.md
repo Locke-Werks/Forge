@@ -94,6 +94,21 @@ itself, not for getting hold of the tools.
 
 ### Which version has what
 
+`[[hooks.pre_install]]` and `{PriorVersion}` need **v0.4.0 or later**. So does
+every build-time check on a hook: an unknown phase, a missing `run`, a
+non-numeric `timeout_ms` or `expect_exit`, and two hooks in a phase sharing an
+id. From v0.4.0 an unknown phase fails the build by name, which is what makes a
+stale pin loud instead of silent from here on. It does not help a pin that is
+already older: a v0.3.0 `lwforge` packages `[[hooks.pre_install]]` without a word
+and a v0.3.0 stub never looks for it, so the hook simply does not run and nothing
+says so.
+
+v0.4.0 also fixes three things a config cannot opt into or out of. Uninstall
+hooks get `{Product}` and `{Version}`, which expanded to nothing before it.
+Failed hooks are reported in the wizard and on an uninstall, both of which
+discarded them. And an absolute path containing `..` or forward slashes reaches
+the filesystem intact, where it used to fail with `0x7b`.
+
 `[[options]]`, `when`, and `as = "user"` on a hook need **v0.3.0 or later**.
 Pinning v0.2.0 or earlier does not fail the build and does not warn. `lwforge`
 flattens the keys into the container like any others and skips the validation
@@ -131,7 +146,7 @@ on:
 env:
   # Pin it. One place to bump, and a Forge release cannot silently change what
   # this job produces. See the version note under "Getting lwforge and lwstub".
-  FORGE_VERSION: v0.3.0
+  FORGE_VERSION: v0.4.0
 
 jobs:
   release:

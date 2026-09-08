@@ -65,9 +65,9 @@ else. Nothing above resolves a known folder, so build those paths out of
 
 ### In hook `args`
 
-Additionally, and only there. Resolved against the account **that hook runs as**
-rather than against the installer's own token. See `as` under
-`[[hooks.<phase>]]`.
+Additionally, and only there. The `User*` five are resolved against the account
+**that hook runs as** rather than against the installer's own token. See `as`
+under `[[hooks.<phase>]]`.
 
 | Token | Meaning |
 |---|---|
@@ -76,6 +76,16 @@ rather than against the installer's own token. See `as` under
 | `{UserLocalAppData}` | `FOLDERID_LocalAppData` |
 | `{UserDesktop}` | `FOLDERID_Desktop` |
 | `{UserPrograms}` | `FOLDERID_Programs` |
+| `{PriorVersion}` | The version already installed, or empty on a fresh install |
+
+`{PriorVersion}` is what Add/Remove Programs holds at the moment the hook runs,
+which on every install phase is the version about to be replaced: the ARP entry
+is not rewritten until later. That is how a hook tells an upgrade from a fresh
+install without going and reading the registry itself. It is deliberately empty
+on `pre_uninstall` and `post_uninstall`, where the same read would answer with
+the version being removed before the ARP key is deleted and with nothing after
+it, and one token meaning two things inside one uninstall is worse than a token
+that means nothing there.
 
 `{LocalAppData}` and `{UserLocalAppData}` name the same known folder and are not
 the same path. The first is expanded once, by the installer, for `install.dir`.
@@ -116,7 +126,7 @@ Choose `required` unless the license has to be read before the UAC prompt.
 |---|---|
 | `license_text` | Shown on the first page. Acceptance is required to proceed |
 | `warning` | Shown in the error colour above the checkbox |
-| `theme.*` | Any of `background`, `surface`, `border`, `border_hover`, `accent`, `accent_soft`, `text`, `text_body`, `text_muted`, `text_faint`, `error`, `success` as `#rrggbb` or `#aarrggbb`. Omit the block for the Locke Werks palette |
+| `theme.*` | Any of `background`, `surface`, `border`, `border_hover`, `accent`, `accent_soft`, `text`, `text_body`, `text_muted`, `text_faint`, `error`, `success`, `warning` as `#rrggbb` or `#aarrggbb`. Omit the block for the Locke Werks palette |
 
 ## `[[options]]`
 
@@ -282,23 +292,35 @@ per-user writes `HKCU\SOFTWARE\Classes`.
 
 | Phase | When |
 |---|---|
+| `pre_install` | before any payload file is written. See below |
 | `post_extract` | files are in place, nothing registered yet |
 | `pre_register` | last chance before the registry and shortcuts are touched |
 | `post_install` | everything is done |
 | `pre_uninstall` | before anything is removed |
 | `post_uninstall` | after the registry, services and shortcuts are gone, before the files are deleted |
 
+A phase name that is not one of those six **fails the build**, naming the ones
+that exist. A misspelled table would otherwise be packaged into the container,
+never validated, never digest-resolved and never run, with nothing said about it
+at build time or install time.
+
 | Key | Notes |
 |---|---|
-| `id` | Name used in logs |
-| `run` | Must start with `payload:` and name a payload member |
+| `id` | Name used in warnings. Two hooks in one phase sharing an id fails the build |
+| `run` | **Required.** Must start with `payload:` and name a payload member |
 | `as` | `installer` (default) or `user`. See below |
 | `when` | Gates the hook on an option |
 | `args` | Array. Passed as argv, never through a shell. Tokens are expanded |
 | `sha256` | `"auto"` makes `lwforge` fill it in. An explicit value is verified and a mismatch fails the build |
-| `expect_exit` | Array of acceptable codes. Defaults to `[0]` |
-| `timeout_ms` | Defaults to 120000 |
-| `vital` | `true` aborts the install on failure. Defaults to `false` |
+| `expect_exit` | Array of acceptable codes. Defaults to `[0]`. Each must be a whole number |
+| `timeout_ms` | Defaults to 120000. Must be a positive whole number |
+| `vital` | `true` aborts the install on failure. Defaults to `false`. On an uninstall phase it fails the exit code instead, see below |
+
+`expect_exit` and `timeout_ms` are checked at build time because both are read
+at install time by a parser that falls back to its default on anything it cannot
+make sense of. `timeout_ms = "30s"` would quietly have become 120000 and a
+non-numeric `expect_exit` entry would quietly have become `0`, which is the one
+value that means success.
 
 A hook may only run a payload member whose digest matches. The config is inside
 the Authenticode-covered region, so changing either the digest or the binary it
@@ -309,15 +331,42 @@ by it.
 A digest mismatch at runtime is always fatal, `vital` or not, because it means
 the file on disk is not the file the signature vouched for.
 
-There is no pre-extract phase. A hook that ran before the payload was on disk
-would have to be unpacked somewhere first, and the only place available before
-the install directory exists is a world-writable temp directory, which is the
-one place a signed elevated process should not execute from. `post_extract` is
-the earliest point a product's own code can run.
-
 `post_uninstall` runs before the payload files are deleted, because the hook is
 one of them. Everything registered is already gone by then, which is what the
 phase name promises.
+
+### `pre_install`
+
+The only phase that runs before the payload replaces what is already installed,
+which makes it the only place a product can stop its own running copy before the
+files under it are swapped. Without it an upgrade leaves every client talking to
+the old image out of its renamed backup until something restarts it, and the
+running image holds that backup open so it cannot be cleaned up either.
+
+It works by placing the hook's own binary at its final path first, journaled like
+any other write, and then running it before anything else is extracted. So the
+hook still executes from the install directory that every other phase executes
+from: the objection that ruled out running before extraction was to a
+world-writable temp directory, and that still stands. What changes is the
+moment, not the location or its ACL. A rollback removes the early copy, or
+restores the original it displaced, exactly as it does for every other file.
+
+**A `pre_install` hook must depend on nothing but the operating system and
+itself.** The rest of the payload is not on disk yet, and on an upgrade the copy
+that is there belongs to the version being replaced. A hook is a separate
+process, so the stub's own DLL search hardening does not cover it and it resolves
+imports starting with its own directory: a payload-supplied dependency is missing
+on a fresh install and is the previous version's on an upgrade. A single
+self-contained executable qualifies. Anything that ships its runtime beside it
+does not, and belongs in `post_extract`.
+
+`{PriorVersion}` is empty on a fresh install, so a hook can do nothing when
+there is nothing to stop.
+
+One interaction to know about: a `process_not_running` preflight blocks the
+install before any hook runs. If a `pre_install` hook exists to stop the same
+process, the preflight will refuse the install first and the hook will never get
+the chance. Pick one.
 
 ### `as = "user"`
 
@@ -354,6 +403,46 @@ ends up owning what it writes.
 Anything else fails the build. A mistyped `as` that fell back to `installer`
 would silently run elevated, which is the outcome the key exists to avoid.
 
+### How a hook is run
+
+The working directory is the install directory, in every phase.
+
+The environment is the installer's own for `as = "installer"`, and the account's
+own for `as = "user"`, built from that user's token. That second part is what
+actually moves `%USERPROFILE%` and `%APPDATA%`; without it a hook runs as the
+right account with the wrong paths.
+
+There is no shell anywhere in the path. `run` names the executable and `args` is
+passed as argv, so nothing in the config can be read as an operator, a redirect
+or a second command.
+
+The hook and everything it starts run inside a job object. On `timeout_ms` the
+whole tree is terminated and the hook is reported as failed with code 258
+(`WAIT_TIMEOUT`); that is not an exit code the hook chose, so listing 258 in
+`expect_exit` does not make a timeout succeed.
+
+### What a failed hook does, and does not, undo
+
+A rollback reverses files, registry values, environment entries, services,
+shortcuts and file associations, because the installer recorded each of those as
+it made them. It cannot reverse what a hook did: the hook is an opaque signed
+binary and the engine has no idea what it touched. A `vital` hook failing after
+an earlier hook has already changed the machine leaves that earlier change in
+place.
+
+That is worth knowing when deciding what belongs in a hook and what belongs in a
+declarative `[[actions]]` entry, which does have an exact undo.
+
+### Where a failure is reported
+
+An install prints every failed hook as a warning: to the console in silent mode,
+and on the final page of the wizard, which says the install completed with
+warnings rather than reporting a clean finish. A `vital` failure is a failed
+install and gets the error page and exit code 1603 instead.
+
+An uninstall reports the same way, to the console in silent mode and in one
+dialog interactively.
+
 ### Uninstall hooks
 
 They travel in the install manifest, since the uninstaller has no container.
@@ -362,7 +451,22 @@ which is a real reduction and is stated here rather than glossed.
 
 The options as they were answered travel with them, so a `when` on an uninstall
 hook is evaluated against what the user actually chose rather than against the
-defaults.
+defaults. `{Product}` and `{Version}` are the ones recorded at install time, so
+they name what is being removed. Both are empty for an install performed by
+v0.3.0 or earlier, which did not record them.
+
+**An uninstall never stops for a failed hook, `vital` or not.** Leaving somebody
+unable to remove a product because the product's own cleanup code is broken is
+worse than removing it with the cleanup half done. What `vital` does on these two
+phases is fail the uninstaller's exit code, 1603 after the removal has finished,
+so a deployment tool can tell a clean removal from a dirty one. Everything is
+still gone.
+
+A digest mismatch stops the rest of that phase, as it does on an install. That is
+reachable here without any tampering: the manifest pins the bytes as they were at
+install time, so a product that replaces its own binaries in place, or an
+antivirus that quarantines and restores one, invalidates the pin. The uninstall
+reports both the mismatch and that the hooks after it did not run.
 
 ## Command line and exit codes
 
@@ -394,14 +498,20 @@ read them without a custom mapping:
 |---|---|
 | 0 | Success |
 | 1602 | User cancelled, including a declined UAC prompt |
-| 1603 | Failure, or a preflight requirement not met |
+| 1603 | Failure, a preflight requirement not met, or an uninstall whose `vital` hook failed |
 | 1618 | Another instance is already running |
 | 1638 | Another version is installed; used for a refused downgrade |
 
-1603 covers both a failed install and a machine that does not qualify, so a
-caller that needs to tell them apart has to read the message. The one split worth
-having is carved out already: a refused downgrade gets 1638 rather than being
-buried in 1603.
+1603 covers a failed install, a machine that does not qualify, and an uninstall
+that removed everything but could not finish its cleanup, so a caller that needs
+to tell them apart has to read the message. The one split worth having is carved
+out already: a refused downgrade gets 1638 rather than being buried in 1603. A
+sixth code was not invented for the uninstall case, because these five are what
+Intune, SCCM and winget already read without a custom mapping, and a hook the
+config itself called vital failing is a failure by that config's own account.
+
+That last case is the one to know about when something retries on failure: the
+product is gone, so a retried uninstall finds nothing to remove.
 
 There is no reboot-required path yet, so 3010 is never returned. It is still
 worth knowing, because MSI documents 0, 1641 and 3010 all as success and a hook

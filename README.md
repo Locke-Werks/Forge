@@ -47,6 +47,11 @@ installer, in their own environment, from the same elevated install. Its binary
 is digest-pinned and checked before the token is dropped, so lowering privilege
 does not lower the bar. `[[options]]` and `when` decide which of them run.
 
+A `pre_install` hook runs before any payload file is written, which is where a
+product stops its own running copy so the upgrade does not swap the files out
+from under it. Its binary is placed first and nothing else is on disk yet, so it
+has to depend on nothing but the OS and itself.
+
 See `docs/config-schema.md`.
 
 ## How packaging works
