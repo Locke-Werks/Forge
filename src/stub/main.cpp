@@ -411,25 +411,60 @@ int run_uninstall_mode(const Options& options, const std::wstring& self)
     {
         return kExitFailure;
     }
-    const Status s = run_uninstall(install_dir);
+    std::vector<std::string> warnings;
+    bool vital_hook_failed = false;
+    const Status s = run_uninstall(install_dir, &warnings, &vital_hook_failed);
     CoUninitialize();
+
+    if (options.silent)
+    {
+        // Same prefix and shape as the install path, so one log format covers
+        // both. QuietUninstallString is what Intune, SCCM and winget invoke, and
+        // this is the only place a failed cleanup hook can surface for them.
+        for (const std::string& warning : warnings)
+        {
+            write_console("lwi: warning: " + warning + "\n");
+        }
+    }
 
     if (!s)
     {
+        std::string message = s.message();
+        for (const std::string& warning : warnings)
+        {
+            message += "\n" + warning;
+        }
         if (options.silent)
         {
             write_console("lwi: " + s.message() + "\n");
         }
         else
         {
-            MessageBoxW(nullptr, to_wide(s.message()).c_str(), L"Uninstall", MB_ICONERROR | MB_OK);
+            // One box, not two. The failure is the headline and the warnings are
+            // the context for it.
+            MessageBoxW(nullptr, to_wide(message).c_str(), L"Uninstall", MB_ICONERROR | MB_OK);
         }
         return kExitFailure;
     }
 
+    if (!warnings.empty() && !options.silent)
+    {
+        std::string message = "Uninstall finished, but some cleanup steps did not complete:\n";
+        for (const std::string& warning : warnings)
+        {
+            message += "\n" + warning;
+        }
+        MessageBoxW(nullptr, to_wide(message).c_str(), L"Uninstall", MB_ICONWARNING | MB_OK);
+    }
+
     // Everything is gone except this running image and the directory holding it.
     relaunch_to_finish(self, install_dir);
-    return kExitSuccess;
+
+    // The removal succeeded, so the product is gone either way. 1603 rather than
+    // a sixth code, because the five borrowed from MSI are what deployment tools
+    // already read without a custom mapping, and a hook the config called vital
+    // failing is a failure by the config's own account.
+    return vital_hook_failed ? kExitFailure : kExitSuccess;
 }
 
 } // namespace
@@ -686,6 +721,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             InstallPlan chosen = plan;
             chosen.options = wizard.options();
 
+            // Collected here rather than dropped. Without the argument the
+            // parameter defaults to nullptr and report_hooks returns without
+            // writing anything, so every hook warning, every failed shortcut and
+            // every recovered journal went unreported in the one mode with a
+            // person watching.
+            std::vector<std::string> warnings;
             const Status s =
                 run_install(reader, config, chosen, [&](float fraction, const std::wstring& status) {
                     if (wizard.cancelled())
@@ -694,7 +735,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
                     }
                     wizard.set_progress(fraction, status);
                     return true;
-                });
+                }, &warnings);
 
             if (com)
             {
@@ -711,7 +752,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             }
             else
             {
-                wizard.finish_ok();
+                std::vector<std::wstring> wide;
+                wide.reserve(warnings.size());
+                for (const std::string& warning : warnings)
+                {
+                    wide.push_back(to_wide(warning));
+                }
+                wizard.finish_ok(std::move(wide));
             }
         });
 

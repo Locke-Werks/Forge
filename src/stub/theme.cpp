@@ -18,6 +18,7 @@ Theme Theme::from_config(const Config& config)
     t.text_faint = config.get_color("ui.theme.text_faint", t.text_faint);
     t.error = config.get_color("ui.theme.error", t.error);
     t.success = config.get_color("ui.theme.success", t.success);
+    t.warning = config.get_color("ui.theme.warning", t.warning);
     return t;
 }
 

@@ -79,6 +79,17 @@ struct InstallRecord
     std::wstring arp_key;                 // subkey under the Uninstall path
     Scope scope = Scope::Machine;
 
+    /// What the product was called and what version it was, recorded so an
+    /// uninstall hook's {Product} and {Version} mean something.
+    ///
+    /// Stored rather than derived. arp_key happens to hold the product name
+    /// today, but that is a registry-naming decision and coupling argument
+    /// expansion to it means the day it changes, {Product} changes with it. The
+    /// version has no other home at all: uninstall deletes the ARP key, and its
+    /// DisplayVersion with it, before post_uninstall runs.
+    std::wstring product;
+    std::wstring version;
+
     /// The uninstall hooks, copied out of the install config.
     ///
     /// They have to travel here because the uninstaller is a payload-free copy
@@ -151,7 +162,17 @@ Status ensure_directory_exists(const std::wstring& path);
 Status run_install(const ContainerReader& reader, const Config& config, const InstallPlan& plan,
                    const ProgressFn& progress, std::vector<std::string>* warnings = nullptr);
 
-Status run_uninstall(const std::wstring& install_dir);
+/// Removes an install.
+///
+/// warnings collects what did not go to plan without stopping the removal, an
+/// uninstall hook that failed being the usual case. vital_hook_failed is set
+/// when one of those hooks was marked vital, so the caller can fail its exit
+/// code: an uninstall never refuses to run because the product's own cleanup
+/// broke, but something automated has to be able to tell a clean removal from a
+/// dirty one.
+Status run_uninstall(const std::wstring& install_dir,
+                     std::vector<std::string>* warnings = nullptr,
+                     bool* vital_hook_failed = nullptr);
 
 /// Detects an already-installed version. Returns an empty string when absent.
 std::wstring installed_version(const InstallPlan& plan);

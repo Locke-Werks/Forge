@@ -315,6 +315,8 @@ Status InstallRecord::save(const std::wstring& install_dir) const
     Config manifest;
     manifest.set("scope", scope == Scope::Machine ? "machine" : "user");
     manifest.set("arp_key", to_utf8(arp_key));
+    manifest.set("product", to_utf8(product));
+    manifest.set("version", to_utf8(version));
 
     manifest.set("files.count", std::to_string(files.size()));
     for (size_t i = 0; i < files.size(); ++i)
@@ -385,6 +387,10 @@ Status InstallRecord::load(const std::wstring& install_dir)
 
     scope = manifest.get("scope") == "user" ? Scope::User : Scope::Machine;
     arp_key = to_wide(manifest.get("arp_key"));
+    // Absent from a manifest written before 0.4.0, which reads back as empty and
+    // is exactly what those installs already did. No version gate needed.
+    product = to_wide(manifest.get("product"));
+    version = to_wide(manifest.get("version"));
 
     const auto read_list = [&](const char* prefix, std::vector<std::wstring>& out) {
         const int64_t count = manifest.get_int(std::string(prefix) + ".count", 0);
@@ -811,12 +817,18 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
 
     for (const auto& [key, value] : config.entries())
     {
-        if (key.rfind("hooks.pre_uninstall", 0) == 0 || key.rfind("hooks.post_uninstall", 0) == 0)
+        // The trailing dot matters: without it a key such as
+        // hooks.pre_uninstall_extra would be copied into the manifest as though
+        // it were part of this phase.
+        if (key.rfind("hooks.pre_uninstall.", 0) == 0 ||
+            key.rfind("hooks.post_uninstall.", 0) == 0)
         {
             record.hooks.set(key, value);
         }
     }
     record.options = plan.options;
+    record.product = plan.product;
+    record.version = plan.version;
 
     if (Status s = record.save(plan.install_dir); !s)
     {
@@ -847,7 +859,8 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
     return Status::ok();
 }
 
-Status run_uninstall(const std::wstring& install_dir)
+Status run_uninstall(const std::wstring& install_dir, std::vector<std::string>* warnings,
+                     bool* vital_hook_failed)
 {
     InstallRecord record;
     if (Status s = record.load(install_dir); !s)
@@ -861,14 +874,39 @@ Status run_uninstall(const std::wstring& install_dir)
     // The answers the install was given, so a `when` on an uninstall hook is
     // evaluated against what the user actually chose rather than the defaults.
     plan.options = record.options;
+    // Same reasoning for the two tokens: {Product} and {Version} in an uninstall
+    // hook's args mean what this install was, not nothing at all.
+    plan.product = record.product;
+    plan.version = record.version;
 
-    {
-        // Not fatal. Refusing to uninstall because the product's own cleanup
-        // hook failed leaves the user with something they cannot remove, which
-        // is worse than removing it with the cleanup half done.
-        std::vector<HookOutcome> ignored;
-        run_hooks(Phase::PreUninstall, record.hooks, plan, ignored);
-    }
+    // Reported but never fatal. Refusing to uninstall because the product's own
+    // cleanup hook failed leaves the user with something they cannot remove,
+    // which is worse than removing it with the cleanup half done. What a failure
+    // does change is the exit code, via vital_hook_failed, so a deployment tool
+    // is not told a dirty removal was clean.
+    const auto uninstall_phase = [&](Phase phase) {
+        std::vector<HookOutcome> outcomes;
+        const bool ok = run_hooks(phase, record.hooks, plan, outcomes);
+        report_hooks(outcomes, warnings);
+        for (const HookOutcome& outcome : outcomes)
+        {
+            if (!outcome.ok && outcome.vital && vital_hook_failed != nullptr)
+            {
+                *vital_hook_failed = true;
+            }
+        }
+        // run_hooks stops the phase on a vital failure or a digest mismatch and
+        // pushes no outcome for the hooks it never reached, so without this the
+        // interesting half of the problem is invisible: not that one hook
+        // failed, but that the cleanup after it never ran.
+        if (!ok && warnings != nullptr)
+        {
+            warnings->push_back(std::string(phase_key(phase)) +
+                                " stopped early; later hooks in this phase did not run");
+        }
+    };
+
+    uninstall_phase(Phase::PreUninstall);
 
     for (const std::wstring& shortcut : record.shortcuts)
     {
@@ -892,10 +930,7 @@ Status run_uninstall(const std::wstring& install_dir)
     // payload member and a deleted binary cannot be executed. Everything
     // registered is already gone, which is what the phase promises; what is left
     // is the files and the directory holding them.
-    {
-        std::vector<HookOutcome> ignored;
-        run_hooks(Phase::PostUninstall, record.hooks, plan, ignored);
-    }
+    uninstall_phase(Phase::PostUninstall);
 
     for (const std::wstring& relative : record.files)
     {

@@ -47,7 +47,13 @@ class Wizard
 
     // Called from the worker thread.
     void set_progress(float fraction, std::wstring status);
-    void finish_ok();
+    /// Ends the install successfully, listing anything that did not go to plan.
+    ///
+    /// The silent path has always printed these; the wizard threw them away,
+    /// which meant a hook that timed out was reported to nobody and hidden from
+    /// the one person watching. A completed install that quietly did less than
+    /// it said it would is the failure this closes.
+    void finish_ok(std::vector<std::wstring> warnings = {});
     void finish_error(std::wstring message);
 
     [[nodiscard]] bool cancelled() const { return cancelled_.load(); }
@@ -120,6 +126,7 @@ class Wizard
     float progress_ = 0.0f;
     std::wstring status_;
     std::wstring error_;
+    std::vector<std::wstring> warnings_;
 
     std::atomic<bool> cancelled_{false};
     InstallFn install_;

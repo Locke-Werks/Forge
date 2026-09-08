@@ -489,11 +489,12 @@ void Wizard::set_progress(float fraction, std::wstring status)
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void Wizard::finish_ok()
+void Wizard::finish_ok(std::vector<std::wstring> warnings)
 {
     {
         std::lock_guard<std::mutex> lock(state_lock_);
         progress_ = 1.0f;
+        warnings_ = std::move(warnings);
     }
     page_ = Page::Complete;
     KillTimer(hwnd_, kAnimationTimer);
@@ -878,15 +879,52 @@ void Wizard::paint()
 
     case Page::Complete:
     {
-        text(L"Installation complete.", res_->body.Get(),
-             D2D1::RectF(32.0f, height / 2.0f - 20.0f, width - 32.0f, height / 2.0f + 8.0f),
-             theme_.success);
-        if (!install_dir_.empty())
+        std::vector<std::wstring> warnings;
         {
-            text(install_dir_, res_->mono.Get(),
-                 D2D1::RectF(32.0f, height / 2.0f + 12.0f, width - 32.0f, height / 2.0f + 36.0f),
-                 theme_.text_faint);
+            std::lock_guard<std::mutex> lock(state_lock_);
+            warnings = warnings_;
         }
+
+        if (warnings.empty())
+        {
+            text(L"Installation complete.", res_->body.Get(),
+                 D2D1::RectF(32.0f, height / 2.0f - 20.0f, width - 32.0f, height / 2.0f + 8.0f),
+                 theme_.success);
+            if (!install_dir_.empty())
+            {
+                text(install_dir_, res_->mono.Get(),
+                     D2D1::RectF(32.0f, height / 2.0f + 12.0f, width - 32.0f,
+                                 height / 2.0f + 36.0f),
+                     theme_.text_faint);
+            }
+        }
+        else
+        {
+            // Laid out from the top rather than around the middle, because the
+            // list is what the page is now for and it needs the room. The
+            // install did complete, so the headline says so before it qualifies
+            // it: a yellow page over a working install would read as a failure.
+            text(L"Installation complete, with warnings.", res_->body.Get(),
+                 D2D1::RectF(32.0f, 180.0f, width - 32.0f, 208.0f), theme_.warning);
+            if (!install_dir_.empty())
+            {
+                text(install_dir_, res_->mono.Get(),
+                     D2D1::RectF(32.0f, 212.0f, width - 32.0f, 236.0f), theme_.text_faint);
+            }
+
+            std::wstring body;
+            for (const std::wstring& warning : warnings)
+            {
+                if (!body.empty())
+                {
+                    body += L"\n";
+                }
+                body += warning;
+            }
+            text(body, res_->small_text.Get(),
+                 D2D1::RectF(32.0f, 248.0f, width - 32.0f, height - 90.0f), theme_.text_body);
+        }
+
         stroke_round(rc_primary_, theme_.radius_button, theme_.border_hover);
         tracked(L"CLOSE", res_->button.Get(), rc_primary_, theme_.accent, 0.10f, 12.0f);
         break;

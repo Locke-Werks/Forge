@@ -29,6 +29,7 @@ struct Theme
     uint32_t text_faint = 0xFF666666;
     uint32_t error = 0xFFF38BA8;
     uint32_t success = 0xFFA6E3A1;
+    uint32_t warning = 0xFFF9E2AF;
 
     // Radii and metrics in DIPs, scaled at draw time by the window's DPI.
     float radius_card = 16.0f;
