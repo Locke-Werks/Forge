@@ -525,6 +525,108 @@ Status create_shortcut(const std::wstring& link_path, const std::wstring& target
     return Status::ok();
 }
 
+/// Writes one payload member to its place in the install directory.
+///
+/// One function rather than a loop body, because two stages place files now: the
+/// pre_install stage puts a hook's own binary down before anything else, and the
+/// main loop does the rest. Two copies of the rename-aside and the journalling
+/// would be two chances for them to disagree about what rollback has to undo.
+///
+/// backup_sequence and total_bytes are by reference for the same reason. The
+/// sequence keys the backup directory and the rename deliberately refuses to
+/// replace an existing destination, so two stages counting separately would make
+/// the second rename fail outright; total_bytes feeds EstimatedSize, which would
+/// under-report by whatever the first stage placed.
+Status place_member(const ContainerReader& reader, size_t index, const InstallPlan& plan,
+                    Journal& journal, InstallRecord& record, uint32_t& backup_sequence,
+                    uint64_t& total_bytes)
+{
+    const std::wstring relative = to_wide(reader.files()[index].path);
+
+    std::vector<uint8_t> contents;
+    if (Status s = reader.extract(index, contents); !s)
+    {
+        return s;
+    }
+
+    const std::wstring destination = plan.install_dir + L"\\" + relative;
+
+    const size_t slash = relative.find_last_of(L'\\');
+    if (slash != std::wstring::npos)
+    {
+        const std::wstring relative_dir = relative.substr(0, slash);
+        if (GetFileAttributesW(long_path(plan.install_dir + L"\\" + relative_dir).c_str()) ==
+            INVALID_FILE_ATTRIBUTES)
+        {
+            if (Status s = journal.record(JournalOp::DirCreated, relative_dir); !s)
+            {
+                return s;
+            }
+        }
+        if (Status s = ensure_directory(plan.install_dir + L"\\" + relative_dir); !s)
+        {
+            return s;
+        }
+        if (std::find(record.directories.begin(), record.directories.end(), relative_dir) ==
+            record.directories.end())
+        {
+            record.directories.push_back(relative_dir);
+        }
+    }
+
+    const bool exists =
+        GetFileAttributesW(long_path(destination).c_str()) != INVALID_FILE_ATTRIBUTES;
+
+    if (exists)
+    {
+        // Rename the original aside rather than overwriting it. This is
+        // both the rollback copy and the only way to replace a file that is
+        // currently running: Windows permits renaming a mapped image, it
+        // only forbids unlinking one. MOVEFILE_REPLACE_EXISTING is
+        // deliberately NOT passed, because the destination must not exist.
+        const std::wstring backup_relative = Journal::backup_path_for(relative, backup_sequence++);
+        const std::wstring backup = plan.install_dir + L"\\" + backup_relative;
+
+        const size_t backup_slash = backup.find_last_of(L'\\');
+        if (backup_slash != std::wstring::npos)
+        {
+            if (Status s = ensure_directory(backup.substr(0, backup_slash)); !s)
+            {
+                return s;
+            }
+        }
+
+        if (Status s = journal.record(JournalOp::FileReplaced, relative, backup_relative); !s)
+        {
+            return s;
+        }
+
+        if (!MoveFileExW(long_path(destination).c_str(), long_path(backup).c_str(), 0))
+        {
+            return Status::error(
+                Code::IoError,
+                win32_message("MoveFileExW (saving the original of " + to_utf8(relative) + ")",
+                              GetLastError()));
+        }
+    }
+    else
+    {
+        if (Status s = journal.record(JournalOp::FileCreated, relative); !s)
+        {
+            return s;
+        }
+    }
+
+    if (Status s = write_whole_file(destination, contents); !s)
+    {
+        return s;
+    }
+
+    record.files.push_back(relative);
+    total_bytes += contents.size();
+    return Status::ok();
+}
+
 } // namespace
 
 std::wstring installed_version(const InstallPlan& plan)
@@ -624,88 +726,11 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
             return abort(s);
         }
 
-        std::vector<uint8_t> contents;
-        if (Status s = reader.extract(i, contents); !s)
+        if (Status s = place_member(reader, i, plan, journal, record, backup_sequence, total_bytes);
+            !s)
         {
             return abort(s);
         }
-
-        const std::wstring destination = plan.install_dir + L"\\" + relative;
-
-        const size_t slash = relative.find_last_of(L'\\');
-        if (slash != std::wstring::npos)
-        {
-            const std::wstring relative_dir = relative.substr(0, slash);
-            if (GetFileAttributesW(long_path(plan.install_dir + L"\\" + relative_dir).c_str()) ==
-                INVALID_FILE_ATTRIBUTES)
-            {
-                if (Status s = journal.record(JournalOp::DirCreated, relative_dir); !s)
-                {
-                    return abort(s);
-                }
-            }
-            if (Status s = ensure_directory(plan.install_dir + L"\\" + relative_dir); !s)
-            {
-                return abort(s);
-            }
-            if (std::find(record.directories.begin(), record.directories.end(), relative_dir) ==
-                record.directories.end())
-            {
-                record.directories.push_back(relative_dir);
-            }
-        }
-
-        const bool exists =
-            GetFileAttributesW(long_path(destination).c_str()) != INVALID_FILE_ATTRIBUTES;
-
-        if (exists)
-        {
-            // Rename the original aside rather than overwriting it. This is
-            // both the rollback copy and the only way to replace a file that is
-            // currently running: Windows permits renaming a mapped image, it
-            // only forbids unlinking one. MOVEFILE_REPLACE_EXISTING is
-            // deliberately NOT passed, because the destination must not exist.
-            const std::wstring backup_relative =
-                Journal::backup_path_for(relative, backup_sequence++);
-            const std::wstring backup = plan.install_dir + L"\\" + backup_relative;
-
-            const size_t backup_slash = backup.find_last_of(L'\\');
-            if (backup_slash != std::wstring::npos)
-            {
-                if (Status s = ensure_directory(backup.substr(0, backup_slash)); !s)
-                {
-                    return abort(s);
-                }
-            }
-
-            if (Status s = journal.record(JournalOp::FileReplaced, relative, backup_relative); !s)
-            {
-                return abort(s);
-            }
-
-            if (!MoveFileExW(long_path(destination).c_str(), long_path(backup).c_str(), 0))
-            {
-                return abort(Status::error(
-                    Code::IoError,
-                    win32_message("MoveFileExW (saving the original of " + to_utf8(relative) + ")",
-                                  GetLastError())));
-            }
-        }
-        else
-        {
-            if (Status s = journal.record(JournalOp::FileCreated, relative); !s)
-            {
-                return abort(s);
-            }
-        }
-
-        if (Status s = write_whole_file(destination, contents); !s)
-        {
-            return abort(s);
-        }
-
-        record.files.push_back(relative);
-        total_bytes += contents.size();
     }
 
     if (Status s = fault_check(step++); !s)
