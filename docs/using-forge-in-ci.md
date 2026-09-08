@@ -66,25 +66,31 @@ reads its own container correctly. Verify it anyway, per the workflow below.
 
 ## Getting lwforge and lwstub
 
-`Locke-Werks/Forge` is a **private** repository, so `${{ github.token }}` cannot
-read its releases from another repository. Pick one:
+`Locke-Werks/Forge` is a **public** repository. Its releases are readable with
+the `${{ github.token }}` every workflow already has, so there is no PAT to
+create, no secret to store, and nothing to grant. Pick one:
 
-**Preferred: download the signed release assets with a token.** Create a
-fine-grained PAT or GitHub App installation token with `Contents: read` on
-`Locke-Werks/Forge` and store it in the consuming repo as `FORGE_TOKEN`. You get
+**Preferred: download the signed release assets.** Point `gh release download`
+at `Locke-Werks/Forge` with `GH_TOKEN: ${{ github.token }}`. You get
 `lwstub.exe` already signed, which removes an entire signing pass.
+
+`GH_TOKEN` still has to be set to something. `gh` refuses to run unauthenticated
+inside Actions and says so before it reaches the network, which reads like a
+permissions failure and is not one. The default token satisfies it; no scope on
+it matters, because the repository is public.
 
 Pin the tag rather than tracking latest, so a Forge release cannot change what a
 product's release job produces without anyone choosing it. The workflow below
 puts the tag in one `env` value for that reason.
 
 **Alternative: vendor the two binaries.** Commit the signed `lwforge.exe` and
-`lwstub.exe` into the consuming repo under `tools/`. No token, no network. The
-cost is binaries in git and a manual bump when Forge releases.
+`lwstub.exe` into the consuming repo under `tools/`. No network at release time.
+The cost is binaries in git and a manual bump when Forge releases.
 
 **Last resort: build Forge from source.** This produces an **unsigned** stub, so
 you must add a signing pass on the stub before forging. See the last section.
-Do not choose this to avoid a token.
+The release assets are already signed, so this path is for changes to Forge
+itself, not for getting hold of the tools.
 
 ### Which version has what
 
@@ -174,11 +180,12 @@ jobs:
 
       # 4. Fetch the signed toolchain. lwstub.exe is already signed in the
       #    release, which is what makes the embedded uninstaller signed without
-      #    a second signing pass in this repository.
+      #    a second signing pass in this repository. Forge is public, so the
+      #    default token is enough here. No FORGE_TOKEN, no PAT.
       - name: Fetch Forge
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.FORGE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release download $env:FORGE_VERSION --repo Locke-Werks/Forge `
             --pattern '*.exe' --dir tools
@@ -301,14 +308,15 @@ already exist and are shared. You are copying three values.
 | `AZURE_TENANT_ID` | repository **variable** | not sensitive |
 | `AZURE_CLIENT_ID` | repository **variable** | not sensitive |
 | `AZURE_CLIENT_SECRET` | environment **secret** on `release` | the secret |
-| `FORGE_TOKEN` | repository secret | PAT with `Contents: read` on `Locke-Werks/Forge` |
 
 ```
 gh variable set AZURE_TENANT_ID  --repo OWNER/NAME --body "..."
 gh variable set AZURE_CLIENT_ID  --repo OWNER/NAME --body "..."
 gh secret   set AZURE_CLIENT_SECRET --repo OWNER/NAME --env release
-gh secret   set FORGE_TOKEN --repo OWNER/NAME
 ```
+
+Nothing here is needed to reach Forge itself. That was `FORGE_TOKEN`, and it is
+gone with the repository going public.
 
 The tenant and client IDs and the secret belong to the Azure Trusted Signing
 service principal. Keep them in your own credential store and out of the
@@ -335,6 +343,15 @@ configure, and none is planned. Run 30780619380 signed two binaries this way.
 Hunting for a federated setup has already cost a full day against a
 configuration that was never broken. Do not propose it as a fix, do not add
 `id-token: write`, and do not add an `azure/login` step.
+
+**"Forge is private, so this needs a PAT, a `FORGE_TOKEN`, or a GitHub App
+installation token."**
+No. `Locke-Werks/Forge` is public, and `${{ github.token }}` reads its releases
+from any repository. Earlier revisions of this document said otherwise and were
+correct when written; they are not now. If `gh release download` fails, read the
+message before reaching for a token. `gh` declining to run with no `GH_TOKEN`
+set at all is not the same as being denied access to the repository, and the
+fix for the first is the default token, not a new credential.
 
 **"`AZURE_SUBSCRIPTION_ID` is missing, so signing cannot work."**
 Signing does not read it. It is not part of this pipeline.
@@ -404,6 +421,8 @@ Three checks, each of which has caught a real failure:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `signing failed` from `lwforge` | `--sign` passed outside the Forge repo | Drop `--sign`, sign with the action |
+| `gh` exits asking for `GH_TOKEN` | No token in the step's env | Set `GH_TOKEN: ${{ github.token }}`. Forge is public; a PAT is not the fix |
+| 404 from `gh release download` | Wrong tag or asset name, not access | Check `FORGE_VERSION` against the releases page |
 | `Azure.CodeSigning.Dlib.dll not found` | `sign.ps1` or `package.ps1` called on a runner | Use the action |
 | 403 at sign time, login fine | Missing **Artifact Signing Certificate Profile Signer** at `certificateProfiles/specterpoint` scope | Grant the role at profile scope, not account scope |
 | `missing signing configuration` | Variable set at repo scope but secret expected on the `release` environment, or the job has no `environment: release` | Match the job's environment to where the secret lives |
