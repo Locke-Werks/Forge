@@ -36,14 +36,30 @@ class WinHandle
     void* h_ = nullptr;
 };
 
+/// Collapses a path the way Win32 would, without touching the filesystem.
+///
+/// Forward slashes become backslashes, `.` segments are dropped, `..` segments
+/// remove the segment before them, and the root is preserved and never popped
+/// past. Nothing is resolved against the working directory and no link is
+/// followed, so this says nothing about whether the path exists.
+///
+/// Separate from long_path because the caller sometimes wants the tidy form for
+/// a message rather than for an API call.
+std::wstring normalize_path(const std::wstring& path);
+
 /// Prefixes a path with \\?\ so it is not subject to MAX_PATH.
 ///
 /// longPathAware in the manifest is deliberately NOT used: it is necessary but
 /// not sufficient, because HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\
 /// LongPathsEnabled must also be 1 on the target machine, and that is not
-/// something an installer can assume about a customer box. The prefix works
-/// regardless, at the cost of disabling path normalisation, so the input must
-/// already be absolute, backslash-only, and free of . and .. segments.
+/// something an installer can assume about a customer box.
+///
+/// The prefix works regardless, at the cost of disabling the normalisation
+/// Win32 would otherwise do, which is why normalize_path runs first. That used
+/// to be stated here as a precondition on the caller and enforced nowhere: an
+/// absolute path carrying a `..` or a forward slash reached CreateFileW intact
+/// and came back ERROR_INVALID_NAME, which reads as a bad path in a config
+/// rather than as a path this function declined to tidy.
 std::wstring long_path(const std::wstring& path);
 
 WinHandle win_open_read(const std::wstring& path);

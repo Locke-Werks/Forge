@@ -734,10 +734,14 @@ int cmd_build(int argc, wchar_t** argv)
     std::vector<uint8_t> icon;
     if (const std::string icon_path(config.get("product.icon")); !icon_path.empty())
     {
-        const fs::path resolved = fs::path(args.config).parent_path() / icon_path;
+        // Collapsed here as well as inside long_path, so the path in an error
+        // message is the one a person would recognise rather than the raw join
+        // with a .. still sitting in the middle of it.
+        const fs::path resolved =
+            (fs::path(args.config).parent_path() / icon_path).lexically_normal();
         if (Status s = read_whole_file(resolved.wstring(), icon); !s)
         {
-            return fail("reading product.icon: " + s.message());
+            return fail("reading product.icon " + resolved.string() + ": " + s.message());
         }
     }
 

@@ -46,25 +46,131 @@ void WinHandle::reset(void* h)
     h_ = h;
 }
 
+std::wstring normalize_path(const std::wstring& path)
+{
+    // An empty path stays empty. Turning it into "." would hand CreateFileW the
+    // working directory, which succeeds and is never what the caller meant.
+    if (path.empty())
+    {
+        return path;
+    }
+
+    std::wstring in = path;
+    for (wchar_t& c : in)
+    {
+        if (c == L'/')
+        {
+            c = L'\\';
+        }
+    }
+
+    // How much of the front is the root and therefore never collapsed. A `..`
+    // at the top of a drive or a share has nowhere to go, and Win32 leaves it
+    // at the root rather than erroring, so this does the same.
+    size_t root = 0;
+    if (in.size() >= 2 && in[0] == L'\\' && in[1] == L'\\')
+    {
+        // \\server\share, or the \\?\ and \\.\ device prefixes, which are
+        // already literal and must not be rewritten.
+        if (in.size() >= 3 && (in[2] == L'?' || in[2] == L'.'))
+        {
+            return path;
+        }
+        const size_t server = in.find(L'\\', 2);
+        const size_t share = server == std::wstring::npos ? std::wstring::npos
+                                                          : in.find(L'\\', server + 1);
+        root = share == std::wstring::npos ? in.size() : share + 1;
+    }
+    else if (in.size() >= 3 && in[1] == L':' && in[2] == L'\\')
+    {
+        root = 3;
+    }
+    else if (in.size() >= 2 && in[1] == L':')
+    {
+        // C:relative, which is drive-relative and not something to collapse.
+        root = 2;
+    }
+    else if (!in.empty() && in[0] == L'\\')
+    {
+        root = 1;
+    }
+
+    std::vector<std::wstring> segments;
+    size_t start = root;
+    while (start <= in.size())
+    {
+        const size_t end = in.find(L'\\', start);
+        const size_t stop = end == std::wstring::npos ? in.size() : end;
+        const std::wstring segment = in.substr(start, stop - start);
+
+        if (segment == L"..")
+        {
+            // Only inside the path. Popping past the root would turn C:\..\x
+            // into a different drive's worth of nonsense.
+            if (!segments.empty() && segments.back() != L"..")
+            {
+                segments.pop_back();
+            }
+            else if (root == 0)
+            {
+                segments.push_back(segment);
+            }
+        }
+        else if (!segment.empty() && segment != L".")
+        {
+            segments.push_back(segment);
+        }
+
+        if (end == std::wstring::npos)
+        {
+            break;
+        }
+        start = end + 1;
+    }
+
+    // Segments are joined to each other, never to the root: a root that needs a
+    // separator already carries one. "C:" is the case that makes this matter,
+    // because C:relative and C:\relative name different directories.
+    std::wstring out = in.substr(0, root);
+    for (size_t i = 0; i < segments.size(); ++i)
+    {
+        if (i != 0)
+        {
+            out += L'\\';
+        }
+        out += segments[i];
+    }
+
+    // "." and "a\.." both collapse to nothing, which as a path means the
+    // working directory and is spelled ".".
+    return out.empty() ? L"." : out;
+}
+
 std::wstring long_path(const std::wstring& path)
 {
     if (path.size() >= 4 && path.compare(0, 4, L"\\\\?\\") == 0)
     {
         return path;
     }
+
+    // Before anything else, because the prefix below is what disables Win32's
+    // own normalisation and a `..` or a forward slash surviving into a
+    // \\?\ path is ERROR_INVALID_NAME rather than a path that resolves.
+    const std::wstring clean = normalize_path(path);
+
     // A UNC path becomes \\?\UNC\server\share, not \\?\\\server\share.
-    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\')
+    if (clean.size() >= 2 && clean[0] == L'\\' && clean[1] == L'\\')
     {
-        return L"\\\\?\\UNC\\" + path.substr(2);
+        return L"\\\\?\\UNC\\" + clean.substr(2);
     }
     // Relative paths cannot take the prefix, because the prefix disables the
     // normalisation that would resolve them. Leave them alone and let the API
     // fail visibly rather than producing a path that means something else.
-    if (path.size() < 3 || path[1] != L':')
+    if (clean.size() < 3 || clean[1] != L':' || clean[2] != L'\\')
     {
-        return path;
+        return clean;
     }
-    return L"\\\\?\\" + path;
+    return L"\\\\?\\" + clean;
 }
 
 WinHandle win_open_read(const std::wstring& path)
