@@ -1,6 +1,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -150,9 +151,85 @@ int reject_control_characters(const Config& config)
     return 0;
 }
 
-static const char* const kHookPhases[] = {"hooks.post_extract", "hooks.pre_register",
-                                          "hooks.post_install", "hooks.pre_uninstall",
-                                          "hooks.post_uninstall"};
+/// Every phase the stub runs, in the order it runs them.
+///
+/// The single source of truth on this side: everything that validates or
+/// resolves a hook iterates this array, so a phase absent from it is a phase
+/// nothing checks and nothing executes.
+static const char* const kHookPhases[] = {"hooks.pre_install",    "hooks.post_extract",
+                                          "hooks.pre_register",   "hooks.post_install",
+                                          "hooks.pre_uninstall",  "hooks.post_uninstall"};
+
+/// Rejects a hooks.<phase> key naming a phase this stub does not run.
+///
+/// Nothing downstream iterates anything but kHookPhases, so a mistyped phase is
+/// flattened into the container, never validated, never digest-resolved and
+/// never executed, with no diagnostic anywhere. Silence is the worst outcome
+/// available here: the author believes the hook is wired up, and the only
+/// evidence otherwise is on machines nobody is looking at.
+///
+/// This also catches the version trap. A config written for a newer Forge and
+/// built by an older lwforge names a phase the older one has never heard of,
+/// and that is exactly the case that used to package quietly and do nothing.
+int validate_hook_phases(const Config& config)
+{
+    constexpr std::string_view kPrefix = "hooks.";
+    std::vector<std::string> unknown;
+
+    for (const auto& [key, value] : config.entries())
+    {
+        (void)value;
+        if (key.compare(0, kPrefix.size(), kPrefix) != 0)
+        {
+            continue;
+        }
+
+        // To the next dot, or to the end of the key: a table flattens to
+        // hooks.<phase>.0.id and hooks.<phase>.count, and a stray scalar
+        // hooks.foo has no dot after the phase at all.
+        const size_t end = key.find('.', kPrefix.size());
+        const std::string phase =
+            key.substr(kPrefix.size(), end == std::string::npos ? std::string::npos
+                                                                : end - kPrefix.size());
+        if (phase.empty())
+        {
+            continue;
+        }
+
+        const std::string full = std::string(kPrefix) + phase;
+        if (std::find_if(std::begin(kHookPhases), std::end(kHookPhases),
+                         [&](const char* known) { return full == known; }) !=
+            std::end(kHookPhases))
+        {
+            continue;
+        }
+        if (std::find(unknown.begin(), unknown.end(), phase) == unknown.end())
+        {
+            unknown.push_back(phase);
+        }
+    }
+
+    if (unknown.empty())
+    {
+        return 0;
+    }
+
+    std::string message = "not a hook phase this installer runs: ";
+    for (size_t i = 0; i < unknown.size(); ++i)
+    {
+        message += (i == 0 ? "" : ", ") + unknown[i];
+    }
+    // Derived from the array rather than restated, so the list cannot go stale
+    // the next time a phase is added.
+    message += "\n  valid phases:";
+    for (const char* known : kHookPhases)
+    {
+        message += " ";
+        message += std::string(known).substr(kPrefix.size());
+    }
+    message += "\n  the table would be packaged, never validated and never run";
+    return fail(message);
+}
 
 /// Checks the option surface and everything gated on it.
 ///
@@ -266,6 +343,7 @@ int validate_options(const Config& config)
 
     for (const char* phase : kHookPhases)
     {
+        std::vector<std::string> hook_ids;
         const size_t n = config.array_size(phase);
         for (size_t i = 0; i < n; ++i)
         {
@@ -280,6 +358,61 @@ int validate_options(const Config& config)
             {
                 return fail(prefix + "as must be \"installer\" or \"user\", not \"" +
                             std::string(as) + "\"");
+            }
+
+            // A hook with no run is a table that packages, is skipped by digest
+            // resolution, and at install time fails its own target check as a
+            // warning nobody asked for.
+            if (config.get(prefix + "run").empty())
+            {
+                return fail(prefix + "run is required; it names the payload member to execute");
+            }
+
+            // The id is what a warning names, and two hooks in one phase sharing
+            // one makes the report ambiguous about which of them failed.
+            const std::string id = std::string(config.get(prefix + "id"));
+            if (!id.empty())
+            {
+                if (std::find(hook_ids.begin(), hook_ids.end(), id) != hook_ids.end())
+                {
+                    return fail("two hooks in " + std::string(phase) + " share the id \"" + id +
+                                "\"; a warning naming it could mean either");
+                }
+                hook_ids.push_back(id);
+            }
+
+            // Both of these are read with Config::get_int, which returns its
+            // fallback rather than an error on anything it cannot parse. A
+            // timeout of "30s" would silently become the 120000 default and a
+            // junk expect_exit entry would silently become 0, which is the one
+            // value that means success.
+            if (config.has(prefix + "timeout_ms"))
+            {
+                const std::string_view text = config.get(prefix + "timeout_ms");
+                int64_t value = 0;
+                const auto* last = text.data() + text.size();
+                const auto parsed = std::from_chars(text.data(), last, value);
+                if (parsed.ec != std::errc{} || parsed.ptr != last || value <= 0)
+                {
+                    return fail(prefix + "timeout_ms must be a positive whole number of "
+                                         "milliseconds, not \"" +
+                                std::string(text) + "\"");
+                }
+            }
+
+            const size_t expect_count = config.array_size(prefix + "expect_exit");
+            for (size_t e = 0; e < expect_count; ++e)
+            {
+                const std::string_view text = config.get(prefix + "expect_exit." +
+                                                         std::to_string(e));
+                int64_t value = 0;
+                const auto* last = text.data() + text.size();
+                const auto parsed = std::from_chars(text.data(), last, value);
+                if (parsed.ec != std::errc{} || parsed.ptr != last)
+                {
+                    return fail(prefix + "expect_exit." + std::to_string(e) +
+                                " must be a whole number, not \"" + std::string(text) + "\"");
+                }
             }
         }
     }
@@ -536,6 +669,14 @@ int cmd_build(int argc, wchar_t** argv)
     }
 
     if (const int rc = reject_control_characters(config); rc != 0)
+    {
+        return rc;
+    }
+
+    // Before validate_options, because a misspelled phase has to be reported as
+    // a misspelled phase. Otherwise the first thing the author sees is a `when`
+    // error from inside a table that was never going to run at all.
+    if (const int rc = validate_hook_phases(config); rc != 0)
     {
         return rc;
     }
