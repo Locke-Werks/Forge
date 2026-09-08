@@ -712,8 +712,100 @@ Status run_install(const ContainerReader& reader, const Config& config, const In
     uint32_t backup_sequence = 0;
     uint32_t step = 0;
 
+    // The pre_install stage. Placing a hook's own binary and running it before
+    // any other payload file is written is the only way for a product to stop
+    // its running self before the files under it are replaced.
+    //
+    // After Journal::recover, because a previous crashed install may have left a
+    // half-replaced binary and running that is worse than running nothing. After
+    // journal.begin, because these writes have to be recoverable like any other:
+    // a crash between placing the binary and committing would otherwise leave a
+    // new image over an old install with nothing to undo it.
+    std::vector<bool> pre_written(files.size(), false);
+    {
+        const size_t pre_count = config.array_size(phase_key(Phase::PreInstall));
+        for (size_t i = 0; i < pre_count; ++i)
+        {
+            const std::string prefix =
+                std::string(phase_key(Phase::PreInstall)) + "." + std::to_string(i) + ".";
+
+            // Evaluated here as well as in run_hooks, through the same function
+            // so the two cannot disagree. A hook the user declined must not have
+            // its binary placed early: that would reorder the extraction and
+            // journal a write for something that never runs.
+            if (!when_satisfied(config, prefix, plan))
+            {
+                continue;
+            }
+
+            std::string why;
+            const std::string member =
+                hook_payload_member(std::string(config.get(prefix + "run")), why);
+            if (member.empty())
+            {
+                // run_hooks reports this as the hook's own failure a moment from
+                // now, with the reason and the vital rule applied. Placing
+                // nothing is the only thing to do here.
+                continue;
+            }
+
+            const auto found = std::find_if(files.begin(), files.end(), [&](const FileView& file) {
+                return file.path == member;
+            });
+            if (found == files.end())
+            {
+                continue;
+            }
+
+            const size_t index = static_cast<size_t>(std::distance(files.begin(), found));
+            if (pre_written[index])
+            {
+                continue;
+            }
+
+            if (Status s = fault_check(step++); !s)
+            {
+                return abort(s);
+            }
+            if (progress && !progress(0.0f, to_wide(member)))
+            {
+                return abort(Status::error(Code::InvalidArgument, "cancelled"));
+            }
+            if (Status s = place_member(reader, index, plan, journal, record, backup_sequence,
+                                        total_bytes);
+                !s)
+            {
+                return abort(s);
+            }
+            pre_written[index] = true;
+        }
+
+        std::vector<HookOutcome> hook_outcomes;
+        // Said out loud, because a hook that stops a service can sit here for
+        // half a minute and a progress bar frozen at zero reads as a hang.
+        if (progress)
+        {
+            progress(0.0f, L"Preparing");
+        }
+        const bool ok = run_hooks(Phase::PreInstall, config, plan, hook_outcomes);
+        report_hooks(hook_outcomes, warnings);
+        if (!ok)
+        {
+            return abort(Status::error(Code::IoError, "a required pre_install hook failed"));
+        }
+    }
+
     for (size_t i = 0; i < files.size(); ++i)
     {
+        // Already on disk, placed by the stage above. Writing it a second time
+        // would journal a FileReplaced whose saved original is the copy this
+        // same install just made, so rollback would restore the new file over
+        // itself and leave the real original in a backup nothing points at.
+        if (pre_written[i])
+        {
+            continue;
+        }
+
         const std::wstring relative = to_wide(files[i].path);
         if (progress && !progress(static_cast<float>(i) / static_cast<float>(files.size()),
                                   relative))

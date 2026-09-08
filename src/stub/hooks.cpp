@@ -17,55 +17,17 @@ namespace
 
 constexpr DWORD kDefaultTimeoutMs = 120000;
 
-/// Rejects anything that is not a plain relative path inside the payload.
+/// Resolves a hook's `run` to a full path inside the install directory.
 ///
-/// The "payload:" prefix is required rather than optional so a config cannot
-/// name an arbitrary file on the machine by accident or otherwise. Everything
-/// after it is treated as data, never as a command line.
+/// The rejection lives in hook_payload_member; this only joins.
 bool resolve_hook_target(const std::string& spec, const std::wstring& install_dir,
                          std::wstring& out, std::string& why)
 {
-    constexpr std::string_view kPrefix = "payload:";
-    if (spec.size() <= kPrefix.size() || spec.compare(0, kPrefix.size(), kPrefix) != 0)
+    const std::string relative = hook_payload_member(spec, why);
+    if (relative.empty())
     {
-        why = "hook target must start with payload:";
         return false;
     }
-
-    std::string relative = spec.substr(kPrefix.size());
-    for (char& c : relative)
-    {
-        if (c == '/')
-        {
-            c = '\\';
-        }
-    }
-
-    if (relative.empty() || relative.front() == '\\' ||
-        (relative.size() >= 2 && relative[1] == ':'))
-    {
-        why = "hook target must be a relative payload path";
-        return false;
-    }
-
-    size_t start = 0;
-    while (start <= relative.size())
-    {
-        const size_t end = relative.find('\\', start);
-        const std::string_view segment = std::string_view(relative).substr(
-            start, (end == std::string::npos ? relative.size() : end) - start);
-        if (segment == ".." || segment == ".")
-        {
-            why = "hook target contains a relative segment";
-            return false;
-        }
-        if (end == std::string::npos)
-        {
-            break;
-        }
-        start = end + 1;
-    }
-
     out = install_dir + L"\\" + to_wide(relative);
     return true;
 }
@@ -115,6 +77,7 @@ struct Expansion
 {
     std::wstring install_dir;
     std::wstring version;
+    std::wstring prior_version;
     std::wstring product;
     std::wstring user_profile;
     std::wstring user_local_appdata;
@@ -123,11 +86,13 @@ struct Expansion
     std::wstring user_programs;
 };
 
-Expansion make_expansion(const InstallPlan& plan, HANDLE token)
+Expansion make_expansion(const InstallPlan& plan, HANDLE token,
+                         const std::wstring& prior_version)
 {
     Expansion out;
     out.install_dir = plan.install_dir;
     out.version = plan.version;
+    out.prior_version = prior_version;
     out.product = plan.product;
     out.user_profile = known_folder_for(FOLDERID_Profile, token);
     out.user_local_appdata = known_folder_for(FOLDERID_LocalAppData, token);
@@ -147,6 +112,7 @@ std::wstring expand(const std::wstring& text, const Expansion& values)
     const Token tokens[] = {
         {L"{InstallDir}", &values.install_dir},
         {L"{Version}", &values.version},
+        {L"{PriorVersion}", &values.prior_version},
         {L"{Product}", &values.product},
         {L"{UserProfile}", &values.user_profile},
         {L"{UserLocalAppData}", &values.user_local_appdata},
@@ -170,10 +136,63 @@ std::wstring expand(const std::wstring& text, const Expansion& values)
 
 } // namespace
 
+/// Rejects anything that is not a plain relative path inside the payload.
+///
+/// The "payload:" prefix is required rather than optional so a config cannot
+/// name an arbitrary file on the machine by accident or otherwise. Everything
+/// after it is treated as data, never as a command line.
+std::string hook_payload_member(const std::string& spec, std::string& why)
+{
+    constexpr std::string_view kPrefix = "payload:";
+    if (spec.size() <= kPrefix.size() || spec.compare(0, kPrefix.size(), kPrefix) != 0)
+    {
+        why = "hook target must start with payload:";
+        return {};
+    }
+
+    std::string relative = spec.substr(kPrefix.size());
+    for (char& c : relative)
+    {
+        if (c == '/')
+        {
+            c = '\\';
+        }
+    }
+
+    if (relative.empty() || relative.front() == '\\' ||
+        (relative.size() >= 2 && relative[1] == ':'))
+    {
+        why = "hook target must be a relative payload path";
+        return {};
+    }
+
+    size_t start = 0;
+    while (start <= relative.size())
+    {
+        const size_t end = relative.find('\\', start);
+        const std::string_view segment = std::string_view(relative).substr(
+            start, (end == std::string::npos ? relative.size() : end) - start);
+        if (segment == ".." || segment == ".")
+        {
+            why = "hook target contains a relative segment";
+            return {};
+        }
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return relative;
+}
+
 const char* phase_key(Phase phase)
 {
     switch (phase)
     {
+    case Phase::PreInstall:
+        return "hooks.pre_install";
     case Phase::PostExtract:
         return "hooks.post_extract";
     case Phase::PreRegister:
@@ -193,6 +212,15 @@ bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,
 {
     const std::string base = phase_key(phase);
     const size_t count = config.array_size(base);
+
+    // What is in ARP right now, which on an install phase is the version being
+    // replaced: write_arp has not run yet at any of them. Deliberately not
+    // resolved on the uninstall phases, where the same read would answer with
+    // the version being removed before the ARP key is deleted and with nothing
+    // after it, so the same token would mean two things in one uninstall.
+    const bool uninstalling = phase == Phase::PreUninstall || phase == Phase::PostUninstall;
+    const std::wstring prior_version =
+        (count == 0 || uninstalling) ? std::wstring() : installed_version(plan);
 
     // Both are built on first use. An installer with no per-user hooks never
     // reaches for another token, and one with no hooks at all resolves no known
@@ -250,13 +278,13 @@ bool run_hooks(Phase phase, const Config& config, const InstallPlan& plan,
 
             if (!user_values_built)
             {
-                user_values = make_expansion(plan, token);
+                user_values = make_expansion(plan, token, prior_version);
                 user_values_built = true;
             }
         }
         else if (!installer_values_built)
         {
-            installer_values = make_expansion(plan, nullptr);
+            installer_values = make_expansion(plan, nullptr, prior_version);
             installer_values_built = true;
         }
 

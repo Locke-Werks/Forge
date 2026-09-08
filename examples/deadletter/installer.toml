@@ -114,6 +114,24 @@ when   = "desktop_shortcut"
 # SCCM and winget actually invoke.
 type = "arp"
 
+# The only phase that runs before the payload replaces what is already there,
+# which is what makes it the one place a product can stop its running self. Its
+# binary is placed at its final path first and nothing else is on disk yet, so a
+# pre_install hook must depend on nothing but the OS and itself: a
+# payload-supplied DLL is not there to load on a fresh install, and on an upgrade
+# the copy that is there belongs to the version being replaced.
+#
+# {PriorVersion} is what ARP says right now, so it is the version about to be
+# overwritten, and empty on a fresh install.
+[[hooks.pre_install]]
+id     = "stop_running_instances"
+run    = "payload:bin\\deadletterd.exe"
+args   = ["pre_install", "{PriorVersion}"]
+sha256 = "auto"
+expect_exit = [0]
+timeout_ms = 30000
+vital = false
+
 [[hooks.post_install]]
 id     = "register_daemon"
 run    = "payload:bin\\deadletterd.exe"
@@ -148,4 +166,36 @@ when   = "user_profile"
 args   = ["--first-run", "{UserLocalAppData}\\DeadLetter"]
 sha256 = "auto"
 timeout_ms = 60000
+vital  = false
+
+# Uninstall hooks travel in the install manifest rather than the container,
+# since the uninstaller is a payload-free copy of the stub. The option as it was
+# answered travels with them, so this when is evaluated against what the user
+# actually chose at install time rather than against the default here.
+#
+# {Product} and {Version} are the ones recorded at install, so they name what is
+# being removed. {PriorVersion} is not resolved on an uninstall phase and expands
+# to nothing: there is no version being replaced.
+[[hooks.pre_uninstall]]
+id     = "user_profile_teardown"
+run    = "payload:bin\\deadletter.exe"
+as     = "user"
+when   = "user_profile"
+args   = ["--remove-profile", "{UserLocalAppData}\\DeadLetter"]
+sha256 = "auto"
+timeout_ms = 60000
+# vital on an uninstall phase does not stop the removal, because leaving someone
+# unable to remove a product because its own cleanup broke is worse than removing
+# it half cleaned. What it does is fail the uninstaller's exit code, so a
+# deployment tool is not told a dirty removal was clean.
+vital  = false
+
+# After the registry, services and shortcuts are gone and before the files are
+# deleted, because the hook is one of them.
+[[hooks.post_uninstall]]
+id     = "unregister_daemon"
+run    = "payload:bin\\deadletterd.exe"
+args   = ["post_uninstall", "{Product} {Version}"]
+sha256 = "auto"
+timeout_ms = 30000
 vital  = false

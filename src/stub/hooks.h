@@ -10,14 +10,26 @@
 namespace lwi::stub
 {
 
-/// Named points where a product can run its own code.
+/// Named points where a product can run its own code, in the order they run.
 ///
-/// Only phases where the payload is already on disk. A pre-extract hook would
-/// have to be unpacked somewhere first, and the only place available before the
-/// install directory exists is a world-writable temp directory, which is the
-/// one place a signed elevated process should not be executing from.
+/// No phase runs with nothing on disk. pre_install is the earliest, and it works
+/// by placing its own binary at its final destination before anything else, so
+/// the hook still executes from the install directory that every other phase
+/// executes from. The original objection was to a world-writable temp
+/// directory, and it still stands: what changes here is the moment, not the
+/// location or its ACL.
+///
+/// pre_install carries one constraint no other phase does. The rest of the
+/// payload is not there yet, and on an upgrade the previous version's files
+/// still are. A hook is a separate process, so the stub's
+/// SetDefaultDllDirectories does not cover it and it resolves imports starting
+/// with its own directory: a pre_install binary with a payload-supplied
+/// dependency fails to load on a fresh install and binds against the previous
+/// version's copy on an upgrade. It has to depend on nothing but the OS and
+/// itself.
 enum class Phase
 {
+    PreInstall,   // before any payload file is written; only its own binary is there
     PostExtract,  // files are in place, nothing registered yet
     PreRegister,  // last chance before the registry and shortcuts are touched
     PostInstall,  // everything is done
@@ -26,6 +38,16 @@ enum class Phase
 };
 
 const char* phase_key(Phase phase);
+
+/// The payload-relative path a hook's `run` names, empty when the spec is not a
+/// well-formed payload reference and `why` says what was wrong with it.
+///
+/// Exposed so the pre_install stage can find the container member it has to
+/// place early. It shares the rejection rules with the rest of hook target
+/// resolution rather than restating them: a second copy of the `..` check is a
+/// second chance to get wrong the one check that keeps a hook off the rest of
+/// the disk.
+std::string hook_payload_member(const std::string& spec, std::string& why);
 
 /// Which account a hook runs as.
 ///

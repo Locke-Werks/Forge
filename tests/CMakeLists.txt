@@ -1,5 +1,7 @@
 find_package(doctest CONFIG REQUIRED)
 
+add_subdirectory(hookprobe)
+
 # One executable per test file, registered with CTest, so `ctest
 # --output-on-failure` works with no extra wiring. This is Reliquary's pattern,
 # which is the cleanest in the portfolio.
