@@ -116,6 +116,25 @@ That is the local path. To produce a signed installer from another product's
 GitHub Actions workflow, see `docs/using-forge-in-ci.md`, which has the whole
 recipe and a list of the things people wrongly conclude are blocking it.
 
+## Working on Forge
+
+`CONTRIBUTING.md` has the build presets and their gotchas, the invariants that
+are silent when broken, and what to run to verify a change. The four things
+above `ctest` are the ones that matter: the fault matrix sweeps a deliberate
+failure through every step of an install and requires the machine back exactly
+where it started, and the hook matrix proves each hook phase actually ran rather
+than assuming it did.
+
+## Documentation
+
+| | |
+|---|---|
+| `docs/config-schema.md` | Every config key, what it means, and what fails the build |
+| `docs/using-forge-in-ci.md` | Wiring Forge into another product's GitHub Actions release |
+| `docs/container-format.md` | The byte layout and why appended data is inside the signature |
+| `docs/signing.md` | Azure Artifact Signing, local and in CI |
+| `CONTRIBUTING.md` | Building, conventions, invariants, verification, releasing |
+
 ## License
 
 MIT. Deliberately permissive: the stub ships inside installers for products
