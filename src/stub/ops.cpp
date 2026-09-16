@@ -149,17 +149,27 @@ void report_hooks(const std::vector<HookOutcome>& outcomes, std::vector<std::str
     }
 }
 
-Status delete_tree_entry(const std::wstring& path)
+/// What actually happened to one file, so the caller can say so. Removal is
+/// best effort by design: a locked file must not fail the whole uninstall. What
+/// it must not do is pass for a removal.
+enum class Removal
+{
+    Gone,     ///< deleted, or was never there
+    AtReboot, ///< locked, but the delete is queued for the next restart
+    Blocked,  ///< locked, and nothing could be queued
+};
+
+Removal delete_tree_entry(const std::wstring& path)
 {
     const std::wstring full = long_path(path);
     if (DeleteFileW(full.c_str()))
     {
-        return Status::ok();
+        return Removal::Gone;
     }
     const DWORD err = GetLastError();
     if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
     {
-        return Status::ok();
+        return Removal::Gone;
     }
 
     // Read-only files are ours to clear: we wrote them.
@@ -168,14 +178,23 @@ Status delete_tree_entry(const std::wstring& path)
         SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
         if (DeleteFileW(full.c_str()))
         {
-            return Status::ok();
+            return Removal::Gone;
         }
     }
 
     // Still locked, most often because the file is running or an antivirus
     // scanner holds a handle. Defer rather than fail the whole uninstall.
-    MoveFileExW(full.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-    return Status::ok();
+    //
+    // That queue is PendingFileRenameOperations under HKLM, which an unelevated
+    // per-user uninstall cannot write to, so this call is the one that fails on
+    // exactly the installs least likely to be elevated. Its result was thrown
+    // away and the function returned success either way, which is how a locked
+    // file came to be left on disk by an uninstaller reporting that it was done.
+    if (MoveFileExW(full.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT))
+    {
+        return Removal::AtReboot;
+    }
+    return Removal::Blocked;
 }
 
 } // namespace
@@ -1025,9 +1044,42 @@ Status run_uninstall(const std::wstring& install_dir, std::vector<std::string>* 
 
     uninstall_phase(Phase::PreUninstall);
 
+    // What could not be removed, so the end of this function can say so. A
+    // locked file is not a reason to stop, and it is not a reason to keep quiet
+    // either: it is the reason the install directory is still on disk after an
+    // uninstall that reported success.
+    std::vector<std::wstring> at_reboot;
+    std::vector<std::wstring> blocked;
+
+    // The one file that is always locked here is this process's own image, and
+    // it is the caller's job: relaunch_to_finish removes it from a copy in temp
+    // once this process has exited. Reporting it would put a warning on every
+    // uninstall that ever runs, which is the fastest way to teach people that
+    // these warnings are noise.
+    const std::wstring self_image = install_dir + L"\\" + kMetaDir + L"\\" + kUninstallerName;
+
+    const auto remove_file = [&](const std::wstring& path) {
+        const Removal outcome = delete_tree_entry(path);
+        if (_wcsicmp(path.c_str(), self_image.c_str()) == 0)
+        {
+            return;
+        }
+        switch (outcome)
+        {
+        case Removal::Gone:
+            break;
+        case Removal::AtReboot:
+            at_reboot.push_back(path);
+            break;
+        case Removal::Blocked:
+            blocked.push_back(path);
+            break;
+        }
+    };
+
     for (const std::wstring& shortcut : record.shortcuts)
     {
-        delete_tree_entry(shortcut);
+        remove_file(shortcut);
     }
 
     // Everything that is not a file, before the files. A service has to be
@@ -1051,7 +1103,7 @@ Status run_uninstall(const std::wstring& install_dir, std::vector<std::string>* 
 
     for (const std::wstring& relative : record.files)
     {
-        delete_tree_entry(install_dir + L"\\" + relative);
+        remove_file(install_dir + L"\\" + relative);
     }
 
     // Deepest first, so a parent is only attempted once its children are gone.
@@ -1066,7 +1118,27 @@ Status run_uninstall(const std::wstring& install_dir, std::vector<std::string>* 
     // The manifest, then the meta directory, then the install directory itself.
     // The uninstaller is running from inside the meta directory, so its own
     // image cannot be unlinked yet; that is handled by the caller.
-    delete_tree_entry(install_dir + L"\\" + kMetaDir + L"\\" + kManifestName);
+    remove_file(install_dir + L"\\" + kMetaDir + L"\\" + kManifestName);
+
+    // Name them. The uninstaller cannot close whatever holds these, and it is
+    // not going to refuse the uninstall over them, so the one useful thing it
+    // can do is tell the person standing there which files are still on disk
+    // and why. Both lists reach the same places a failed hook does: a message
+    // box interactively, and the lwi: warning: log line under /S.
+    if (warnings != nullptr)
+    {
+        for (const std::wstring& path : at_reboot)
+        {
+            warnings->push_back(to_utf8(path) +
+                                " is in use; it will be removed on the next restart");
+        }
+        for (const std::wstring& path : blocked)
+        {
+            warnings->push_back(to_utf8(path) +
+                                " is in use and could not be removed. Close whatever is using it,"
+                                " then delete it by hand");
+        }
+    }
 
     return Status::ok();
 }
