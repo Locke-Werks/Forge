@@ -52,6 +52,28 @@ jobs:
             exit 1
           fi
 
+      # cmake/LwiVersion.cmake is the single source of truth for the version and
+      # nothing else reads the tag, so the two can disagree and nothing notices.
+      # A tag would then publish binaries whose VERSIONINFO and container META
+      # say something else, under a release named for the tag, and the first
+      # person to find out would be someone reading a version off a file that
+      # does not match the release they downloaded it from.
+      - name: The tag and the version agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          major=$(sed -n 's/^set(LWI_VERSION_MAJOR \([0-9]*\)).*/\1/p' cmake/LwiVersion.cmake)
+          minor=$(sed -n 's/^set(LWI_VERSION_MINOR \([0-9]*\)).*/\1/p' cmake/LwiVersion.cmake)
+          patch=$(sed -n 's/^set(LWI_VERSION_PATCH \([0-9]*\)).*/\1/p' cmake/LwiVersion.cmake)
+          version="$major.$minor.$patch"
+          echo "tag $tag, source $version"
+          if [ "$tag" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match LWI_VERSION $version in cmake/LwiVersion.cmake"
+            echo "bump the version and push that commit before tagging it"
+            exit 1
+          fi
+
   build:
     needs: guards
     runs-on: windows-latest

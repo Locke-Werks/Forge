@@ -94,6 +94,15 @@ itself, not for getting hold of the tools.
 
 ### Which version has what
 
+An uninstaller that cannot remove a file says which one from **v0.4.1 or
+later**. Before it, a locked file was queued for deletion at the next reboot and
+the result of that queuing was discarded, so the uninstall reported success
+either way. The queue is `PendingFileRenameOperations` under HKLM, which an
+unelevated per-user uninstall cannot write to, so on per-user installs the file
+was simply left behind in silence. Pinning v0.4.0 or earlier keeps that
+behaviour: the removal is still best effort, but a failure still passes for a
+removal.
+
 `[[hooks.pre_install]]` and `{PriorVersion}` need **v0.4.0 or later**. So does
 every build-time check on a hook: an unknown phase, a missing `run`, a
 non-numeric `timeout_ms` or `expect_exit`, and two hooks in a phase sharing an
@@ -146,7 +155,7 @@ on:
 env:
   # Pin it. One place to bump, and a Forge release cannot silently change what
   # this job produces. See the version note under "Getting lwforge and lwstub".
-  FORGE_VERSION: v0.4.0
+  FORGE_VERSION: v0.4.1
 
 jobs:
   release:
